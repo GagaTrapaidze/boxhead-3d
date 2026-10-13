@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="ka">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>boxhead: 2play rooms</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0f1a;
+        font-family: system-ui, sans-serif; color: #eaf2ff; }
+      #app { position: fixed; inset: 0; }
+      #app canvas { display: block; }
+      kbd {
+        background: #1e293f; border: 1px solid #3a4a6b; border-bottom-width: 2px;
+        border-radius: 4px; padding: 1px 6px; font-family: inherit; font-size: 12px;
+      }
+
+      /* ---------- HUD ---------- */
+      #hud { position: fixed; inset: 0; z-index: 6; pointer-events: none;
+        user-select: none; font-weight: 600; text-shadow: 0 1px 4px rgba(0,0,0,.85); }
+      #hud[hidden] { display: none; }
+
+      /* Shared stats (score / wave / multiplier / power-up) — top-left. */
+      #sharedStats {
+        position: fixed; top: 14px; left: 14px; font-size: 16px; line-height: 1.6;
+      }
+      #multRow { color: #ffe9a0; }
+      .multHead { font-size: 15px; }
+      #multbar {
+        display: block; width: 200px; height: 7px; margin-top: 3px;
+        background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.25);
+        border-radius: 4px; overflow: hidden;
+      }
+      #multfill {
+        display: block; height: 100%; width: 100%; background: #7ce7a2;
+        transition: width .06s linear, background-color .2s;
+      }
+      #mult2[hidden] { display: none; }
+
+      /* Floating combo milestone banner ("×10 SPREE!"). */
+      #comboBanner {
+        position: fixed; top: 42%; left: 50%; transform: translate(-50%, -50%);
+        z-index: 7; pointer-events: none; user-select: none;
+        font-size: 40px; font-weight: 900; letter-spacing: 2px; color: #ffd35c;
+        text-shadow: 0 2px 12px rgba(0,0,0,.9), 0 0 22px rgba(255,150,40,.7);
+        opacity: 0;
+      }
+      #comboBanner[hidden] { display: none; }
+      #comboBanner.show { animation: comboPop .9s ease-out forwards; }
+      @keyframes comboPop {
+        0% { opacity: 0; transform: translate(-50%, -50%) scale(.6); }
+        18% { opacity: 1; transform: translate(-50%, -50%) scale(1.15); }
+        40% { transform: translate(-50%, -50%) scale(1); }
+        100% { opacity: 0; transform: translate(-50%, -64%) scale(1.05); }
+      }
+
+      /* Themed special-wave banner ("SPEED HORDE!" / "BLACKOUT!"). */
+      #eventBanner {
+        position: fixed; top: 27%; left: 50%; transform: translate(-50%, -50%);
+        z-index: 7; pointer-events: none; user-select: none;
+        font-size: 36px; font-weight: 900; letter-spacing: 3px; color: #8fd4ff;
+        text-shadow: 0 2px 12px rgba(0,0,0,.9), 0 0 26px rgba(80,160,255,.8);
+        opacity: 0;
+      }
+      #eventBanner[hidden] { display: none; }
+      #eventBanner.show { animation: eventSweep 1.6s ease-out forwards; }
+      @keyframes eventSweep {
+        0% { opacity: 0; letter-spacing: 16px; }
+        15% { opacity: 1; }
+        75% { opacity: 1; letter-spacing: 3px; }
+        100% { opacity: 0; letter-spacing: 3px; }
+      }
+      #powerup { color: #d78bff; }
+      #powerup[hidden] { display: none; }
+
+      /* ---------- Per-player status cards (split-screen co-op HUD) ---------- */
+      .pcard {
+        position: fixed; bottom: 16px; z-index: 6; width: 258px;
+        background: rgba(9, 14, 26, .74); border: 1px solid rgba(255,255,255,.14);
+        border-radius: 12px; padding: 10px 12px 12px; font-size: 14px;
+        backdrop-filter: blur(3px);
+      }
+      .pcard.p1 { left: 16px; border-left: 4px solid #7ce7a2; }
+      .pcard.p2 { right: 16px; border-right: 4px solid #6db1ff; }
+      .pcard[hidden] { display: none; }
+      .pcard .pname { font-size: 12px; letter-spacing: 1px; opacity: .85;
+        margin-bottom: 7px; color: #cfe3ff; }
+      .pcard.p1 .pname { color: #9df0ba; }
+      .pcard.p2 .pname { color: #9dc6ff; }
+      .pcard .pkeys { opacity: .65; font-weight: 400; letter-spacing: 0; }
+      .pcard .hprow { display: flex; align-items: center; gap: 8px; }
+      .pcard .hpbar {
+        flex: 1; height: 13px; background: rgba(255,255,255,.12);
+        border: 1px solid rgba(255,255,255,.25); border-radius: 4px; overflow: hidden;
+      }
+      .pcard .hpfill { height: 100%; width: 100%; background: #7ce7a2; transition: width .15s; }
+      .pcard.p2 .hpfill { background: #6db1ff; }
+      .pcard .hpnum { min-width: 30px; text-align: right; font-size: 13px; }
+      .pcard .wrow { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+      .pcard .wicon { flex: none; line-height: 0; }
+      .pcard .wicon svg { width: 36px; height: 22px; display: block; fill: #ffd35c; }
+      .pcard.p2 .wicon svg { fill: #9dc6ff; }
+      .pcard .wname { font-weight: 700; }
+      .pcard .ammoRow { margin-top: 5px; font-size: 13px; opacity: .9; }
+      .pcard .ammoRow[hidden] { display: none; }
+      .pcard .reviveRow {
+        margin-top: 5px; font-size: 13px; font-weight: 800; color: #ff9a3c;
+        letter-spacing: .5px; animation: hudBlink .5s steps(1, end) infinite;
+      }
+      .pcard .reviveRow[hidden] { display: none; }
+      .pcard.downed { border-color: #ff9a3c; opacity: .92; }
+      @keyframes hudBlink { 50% { opacity: .12; } }
+
+      /* Minimal retro intermission countdown, pinned top-centre. */
+      #waveTimer {
+        position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 6;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 18px; font-weight: 800; letter-spacing: 3px; color: #8fd4ff;
+        text-shadow: 0 1px 6px rgba(0,0,0,.9), 0 0 16px rgba(80,160,255,.55);
+        pointer-events: none; user-select: none; white-space: nowrap;
+      }
+      #waveTimer[hidden] { display: none; }
+
+      #message {
+        position: fixed; top: 52px; left: 50%; transform: translateX(-50%); z-index: 6;
+        color: #ffe9a0; font-size: 20px; font-weight: 700; text-align: center;
+        text-shadow: 0 1px 6px rgba(0,0,0,.9); pointer-events: none; user-select: none;
+      }
+      #reviveLabel {
+        position: fixed; z-index: 7; transform: translate(-50%, -100%);
+        color: #ff9a3c; font-size: 17px; font-weight: 800; letter-spacing: 1px;
+        text-shadow: 0 1px 6px rgba(0,0,0,.95); pointer-events: none; user-select: none;
+        white-space: nowrap;
+      }
+      #reviveLabel[hidden] { display: none; }
+      #flash {
+        position: fixed; inset: 0; z-index: 4; pointer-events: none; opacity: 0;
+        transition: opacity .12s ease-out;
+        background: radial-gradient(circle at center, rgba(255,255,255,0) 45%, rgba(255,60,60,.4) 100%);
+      }
+
+      /* ---------- Overlay / menu ---------- */
+      #overlay {
+        position: fixed; inset: 0; z-index: 10; overflow-y: auto;
+        background: rgba(7, 10, 20, .92); backdrop-filter: blur(4px);
+        padding: 24px 16px 48px;
+      }
+      #overlay[hidden] { display: none; }
+      .panel { max-width: 1060px; margin: 0 auto; text-align: center; }
+      .panel[hidden] { display: none; }
+      .panel h1 { font-size: 34px; letter-spacing: 2px; margin-bottom: 4px; text-transform: uppercase; }
+      .panel h1 span { color: #7ce7a2; }
+      .tagline { opacity: .7; margin-bottom: 18px; font-style: italic; }
+
+      .modes { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 16px; }
+      .modeBtn {
+        min-width: 220px; padding: 14px 20px; font-size: 16px; font-weight: 700;
+        color: #0b0f1a; background: #7ce7a2; border: none; border-radius: 10px;
+        cursor: pointer; display: flex; flex-direction: column; gap: 4px; align-items: center;
+      }
+      .modeBtn small { font-weight: 400; opacity: .75; }
+      .modeBtn:hover { background: #9df0ba; }
+      .modeBtn.alt { background: #6db1ff; }
+      .modeBtn.alt:hover { background: #93c7ff; }
+
+      /* ---------- Map select ---------- */
+      .mapSelect { margin-bottom: 18px; }
+      .mapSelect h3 { font-size: 15px; text-transform: uppercase; letter-spacing: 1px;
+        color: #7ce7a2; margin-bottom: 10px; }
+      .mapGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 12px; }
+      .mapCard {
+        display: flex; gap: 12px; align-items: center; text-align: left;
+        background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.12);
+        border-radius: 12px; padding: 12px; cursor: pointer; color: #eaf2ff;
+        transition: border-color .15s, background .15s, box-shadow .15s;
+      }
+      .mapCard:hover { border-color: #6db1ff; }
+      .mapCard.active {
+        border-color: #7ce7a2; background: rgba(124,231,162,.1);
+        box-shadow: 0 0 0 1px #7ce7a2 inset, 0 0 14px rgba(124,231,162,.22);
+      }
+      .mapCard canvas {
+        width: 72px; height: 72px; flex: none; border-radius: 6px;
+        border: 1px solid rgba(255,255,255,.15); background: #0e1626;
+        image-rendering: pixelated;
+      }
+      .mapCard b { display: block; font-size: 15px; color: #7ce7a2; }
+      .mapCard span { display: block; font-size: 12.5px; opacity: .82;
+        line-height: 1.45; margin-top: 3px; }
+
+      #onlinePanel { margin: 0 auto 18px; display: flex; gap: 8px; justify-content: center;
+        align-items: center; flex-wrap: wrap; }
+      #onlinePanel[hidden] { display: none; }
+      #onlinePanel input {
+        padding: 10px 14px; font-size: 16px; letter-spacing: 3px; text-transform: uppercase;
+        border-radius: 8px; border: 1px solid #3a4a6b; background: #131a2b; color: #eaf2ff;
+        width: 160px; text-align: center;
+      }
+      #onlinePanel button {
+        padding: 10px 18px; font-weight: 700; border: none; border-radius: 8px;
+        background: #ffd35c; color: #0b0f1a; cursor: pointer;
+      }
+      #onlineNote { flex-basis: 100%; font-size: 13px; color: #ffd35c; }
+
+      .infoGrid {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 14px; text-align: left;
+      }
+      .card { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
+        border-radius: 12px; padding: 16px; }
+      .card h3 { font-size: 15px; text-transform: uppercase; letter-spacing: 1px;
+        color: #7ce7a2; margin-bottom: 10px; }
+      .card ul { list-style: none; font-size: 14px; line-height: 1.75; }
+      .card li::before { content: "▸ "; color: #7ce7a2; }
+      .card p { font-size: 14px; line-height: 1.65; opacity: .9; }
+
+      .tierList { font-size: 14px; line-height: 1.9; }
+      .tierList b { color: #ffd35c; }
+      .controls { font-size: 13px; line-height: 1.9; }
+      .controls h4 { font-size: 13px; margin-top: 0; color: #6db1ff; }
+      .controls ul { list-style: none; margin: 4px 0 0; }
+      .controls li::before { content: "• "; color: #6db1ff; }
+      /* Active control layout (Solo / P1 / P2) — highlighted on mode switch */
+      .ctrlLayout {
+        border: 1px solid transparent; border-radius: 10px;
+        padding: 10px 12px; margin-bottom: 10px;
+        transition: background .15s, border-color .15s, box-shadow .15s;
+      }
+      .ctrlLayout:last-child { margin-bottom: 0; }
+      .ctrlLayout.active {
+        background: rgba(109, 177, 255, .14);
+        border-color: #6db1ff;
+        box-shadow: 0 0 0 1px #6db1ff inset, 0 0 14px rgba(109, 177, 255, .25);
+      }
+      .ctrlLayout.active h4 { color: #9df0ba; }
+
+      .lore { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      .char { border-radius: 10px; padding: 10px; background: rgba(255,255,255,.05);
+        border-left: 5px solid var(--c); }
+      .char b { display: block; font-size: 15px; color: var(--c); }
+      .char span { font-size: 12.5px; opacity: .85; line-height: 1.5; display: block; margin-top: 3px; }
+      .bambo { --c: #5fae54; } .bon { --c: #4d7fe0; }
+      .bind { --c: #9aa4b5; } .bert { --c: #d3a03c; }
+
+      .foe { margin-bottom: 10px; font-size: 14px; line-height: 1.6; }
+      .foe b { display: block; }
+      .foe.zombie b { color: #d8dde8; }
+      .foe.devil b { color: #ff5b3a; }
+
+      #gameOverPanel h1 { color: #ff6b6b; }
+      .recordBadge {
+        display: inline-block; margin: 6px auto 12px; padding: 6px 18px;
+        font-size: 18px; font-weight: 900; letter-spacing: 2px; color: #0b0f1a;
+        background: linear-gradient(90deg, #ffd35c, #ff9a3c); border-radius: 999px;
+        animation: recordPulse 1s ease-in-out infinite;
+      }
+      .recordBadge[hidden] { display: none; }
+      @keyframes recordPulse { 50% { transform: scale(1.06); filter: brightness(1.15); } }
+      .summaryTable {
+        width: 100%; max-width: 640px; margin: 0 auto 14px; border-collapse: collapse;
+        font-size: 15px; background: rgba(255,255,255,.04);
+        border-radius: 12px; overflow: hidden;
+      }
+      .summaryTable th, .summaryTable td {
+        padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,.08);
+      }
+      .summaryTable th {
+        font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #9dc6ff;
+      }
+      .summaryTable td:first-child { text-align: left; opacity: .8; }
+      .summaryTable .p1col { color: #9df0ba; font-weight: 700; }
+      .summaryTable .p2col { color: #9dc6ff; font-weight: 700; }
+      .summaryTotals { font-size: 16px; line-height: 1.9; margin: 0 auto 18px; }
+      .summaryTotals b { color: #ffd35c; }
+      .bigBtn {
+        display: inline-block; margin: 0 6px; padding: 12px 30px; font-size: 17px;
+        font-weight: 700; border: none; border-radius: 8px; cursor: pointer;
+        background: #7ce7a2; color: #0b0f1a;
+      }
+      .bigBtn.ghost { background: transparent; color: #eaf2ff; border: 1px solid #3a4a6b; }
+      .bigBtn:hover { filter: brightness(1.1); }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="flash"></div>
+
+    <div id="hud" hidden>
+      <div id="waveTimer" hidden>NEXT WAVE IN: 0.0s</div>
+      <div id="sharedStats">
+        <div id="multRow">
+          <div class="multHead">MULTIPLIER ×<span id="multVal">1</span><span id="mult2" hidden></span></div>
+          <div id="multbar"><span id="multfill"></span></div>
+        </div>
+        <div>ქულა: <span id="score">0</span> &nbsp;|&nbsp; ტალღა: <span id="wave">0</span></div>
+        <div id="powerup" hidden>⚡ POWER ×2 — <span id="powerTime">0</span>s</div>
+      </div>
+
+      <!-- Player 1 card (bottom-left): Solo also uses this one. -->
+      <section class="pcard p1" id="card1">
+        <div class="pname">P1 <span class="pkeys">(Arrow Keys / Slash)</span></div>
+        <div class="hprow">
+          <div class="hpbar"><div class="hpfill" id="hp1fill"></div></div>
+          <span class="hpnum" id="hp1val">100</span>
+        </div>
+        <div class="wrow"><span class="wicon" id="wicon1"></span><span class="wname" id="weapon1">Pistol</span></div>
+        <div class="ammoRow" id="ammoRow1">AMMO <span id="ammo1">∞</span></div>
+        <div class="reviveRow" id="revive1" hidden>REVIVING IN: 10s</div>
+      </section>
+
+      <!-- Player 2 card (bottom-right): only in Local 2-Player. -->
+      <section class="pcard p2" id="card2" hidden>
+        <div class="pname">P2 <span class="pkeys">(WASD / Space)</span></div>
+        <div class="hprow">
+          <div class="hpbar"><div class="hpfill" id="hp2fill"></div></div>
+          <span class="hpnum" id="hp2val">100</span>
+        </div>
+        <div class="wrow"><span class="wicon" id="wicon2"></span><span class="wname" id="weapon2">Pistol</span></div>
+        <div class="ammoRow" id="ammoRow2">AMMO <span id="ammo2">∞</span></div>
+        <div class="reviveRow" id="revive2" hidden>REVIVING IN: 10s</div>
+      </section>
+    </div>
+
+    <div id="message"></div>
+    <div id="comboBanner" hidden></div>
+    <div id="eventBanner" hidden></div>
+    <div id="reviveLabel" hidden>REVIVING IN: 10s</div>
+
+    <div id="overlay">
+      <!-- ============ START MENU ============ -->
+      <section class="panel" id="menuPanel">
+        <h1>boxhead: <span>2play rooms</span></h1>
+        <p class="tagline">Kill or be killed. Keep the multiplier high — earn better weapons.</p>
+
+        <div class="modes">
+          <button class="modeBtn" data-mode="single" type="button">
+            ერთი მოთამაშე
+            <small>Keyboard (8-განი მიზანი)</small>
+          </button>
+          <button class="modeBtn alt" data-mode="duo" type="button">
+            2 მოთამაშე — ერთი კლავიატურა
+            <small>Local co-op / shared keyboard</small>
+          </button>
+          <button class="modeBtn" data-mode="online" type="button">
+            ონლაინ მულტიპლეიერი
+            <small>Room code connection</small>
+          </button>
+        </div>
+
+        <div id="onlinePanel" hidden>
+          <input id="roomCode" maxlength="6" placeholder="კოდი" autocomplete="off" />
+          <button id="joinRoom">შეერთი</button>
+          <button id="createRoom">ოთახის შქმნა</button>
+          <p id="onlineNote">ონლაინ რეჟიმი Phase 2-ში — სერვერი/ლობი ჯერ მზად არაა.</p>
+        </div>
+
+        <!-- Pre-game map selection (cards are generated from MAP_DEFINITIONS). -->
+        <div class="mapSelect">
+          <h3>რუკის არჩევა — Map Select</h3>
+          <div class="mapGrid" id="mapGrid"></div>
+        </div>
+
+        <div class="infoGrid">
+          <div class="card">
+            <h3>როგორ ვითამაშოთ — წესები</h3>
+            <ul>
+              <li><b>მიზანი:</b> მოკალი ან მოკველი — გადარჩი რაც შეიძლება დიდხანს.</li>
+              <li><b>Multiplier:</b> ყოველი მკვლელობა <b>+1</b>-ს ამატებს; მრავლები დროთი იშლება
+                <i>(მაღალ ტიერებზე უფრო სწრაფად)</i>. დაჭრისას ნულდება.</li>
+              <li><b>იარაღის ტიერები</b> multiplier-ით იხსნება:</li>
+              <li><b>ტალღის დასრულება:</b> ყოველი ტალღის ბოლოს HP სრულად აღდგება (<b>+100% HP</b>).</li>
+            </ul>
+            <div class="tierList">
+              <b>×1</b> Crate/Wood Box → <b>×4</b> Shotgun → <b>×8</b> Uzi → <b>×10</b> Grenade →
+              <b>×16</b> Barrel/Wall → <b>×20</b> Rocket → <b>×24</b> Railgun
+            </div>
+            <div class="controls">
+              <div class="ctrlLayout active" id="ctrlSingle">
+                <h4>[ Single Player ]</h4>
+                <ul>
+                  <li>Movement: WASD or Arrow Keys</li>
+                  <li>Shoot / Action: Spacebar</li>
+                  <li>Switch Weapons: [Q] / [E] or [1] - [8]</li>
+                </ul>
+              </div>
+              <div class="ctrlLayout" id="ctrlP1">
+                <h4>[ Local 2-Player: Player 1 ]</h4>
+                <ul>
+                  <li>Movement: Arrow Keys (↑, ↓, ←, →)</li>
+                  <li>Shoot / Action: [/] (Slash) or [Enter]</li>
+                  <li>Switch Weapons: [,] (Prev) and [.] (Next)</li>
+                </ul>
+              </div>
+              <div class="ctrlLayout" id="ctrlP2">
+                <h4>[ Local 2-Player: Player 2 ]</h4>
+                <ul>
+                  <li>Movement: [W], [A], [S], [D]</li>
+                  <li>Shoot / Action: [Space]</li>
+                  <li>Switch Weapons: [Q] (Prev) and [E] (Next)</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>პერსონაჟები — ლორი</h3>
+            <div class="lore">
+              <div class="char bambo"><b>Bambo</b>
+                <span>ექს-სამხედრო. გამოცდილი ჯუნგლებისა და ურბანული ომის მებრძოლი — გამძლე და სანდო.</span></div>
+              <div class="char bon"><b>Bon</b>
+                <span>SWAT ოპერატივი, ახლო ბრძოლის სპეციალისტი — სწრაფი რეაქცია და მოკლე დისტანცია.</span></div>
+              <div class="char bind"><b>Bind</b>
+                <span>ბრიტანელი საიდუმლო აგენტი. ზუსტი სროლა, ცივი გონება, მინიმალური ხმაური.</span></div>
+              <div class="char bert"><b>Bert</b>
+                <span>ექს-მარინი, ფულისთვის მებრძოლი. ნედლი ძალა და დიდი იარაღების სიყვარული.</span></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>მტრები — რჩევები</h3>
+            <div class="foe zombie"><b>Zombie</b>
+              ნელი melee ჰორდები — საშიში მხოლოდ გროვაში. გამოიყენე ბარიკადები და ჩიხები,
+              გრენატი სამიზნე ჯგუფებისთვის.</div>
+            <div class="foe devil"><b>Devil</b>
+              შორი მანძილიდან ცეცხლოვან ბურთებს ისრის. უწყვეტი სწრაფი სროლით (Uzi)
+              შეუძლია <i>შეაკარო</i> თავდასხმა — არ შეაწყვეტინო სროლა!</div>
+            <div class="foe"><b>ბარიკადები</b>
+              Barrel/Wall და Crate იარაღით ბადებული კედელი გამძლეობის (HP) მქონეა — ზომბიები ან
+              ანგრევენ (ღრღნიან), ან flow-field-ით უვლიან.</div>
+            <div class="foe"><b>Wooden Crate (×1)</b>
+              ხის ყუთი — 150 HP, მთელ უჯრას იკავებს და <b>არ ფეთქდება</b>. ზომბები კლანჭებით
+              ანგრევენ; შეგიძლია ესროლო და გაანადგურო. ბარელისგან განსხვავებით — უსაფრთხო კედელია.</div>
+            <div class="foe"><b>Special Waves</b>
+              ყოველ მე-4 ტალღაზე სპეციალური ვითარება: <b>SPEED HORDE</b> (მხოლოდ სწრაფი runners +80%)
+              ან <b>BLACKOUT</b> (არენა ბნელდება — გამოიყენე ფარა; მუზარაკის ცეცხლი და აფეთქება
+              ხილვადობას გაძლევს).</div>
+            <div class="foe"><b>Co-op High-Five</b>
+              დაცემული პარტნიორის გარშემო მოელვარე წრე ჩნდება. შედი წრეში და 2.5 წამი იდე —
+              მყისიერი აღდგენა (10 წამის ლოდინის გარეშე!).</div>
+            <div class="foe"><b>Drops — იარაღები</b>
+              მოკლული ზომბები <b>ხშირად</b> ტოვებენ მოლივლივე იარაღის ყუთებს. გადააბიჯე და მაშინვე აიღებ
+              (იარაღი განიბლოკება, თუ ჯერ არ გქონდა; თუ გაქვს — ტყვიაებს ამატებს):<br/>
+              <span style="color:#ff4444">■ წითელი</span> — Shotgun (+30) &nbsp;
+              <span style="color:#ffd35c">■ ყვითელი</span> — Uzi (+150) &nbsp;
+              <span style="color:#2f7d32">■ მწვანე</span> — Grenade (+5) &nbsp;
+              <span style="color:#ff7a1a">■ ნარინჯისფერი</span> — Explosive Barrel (+3) &nbsp;
+              <span style="color:#d78bff">■ იისფერი</span> — POWER ×2</div>
+            <div class="foe"><b>Explosive Barrel</b>
+              ნარინჯისფერი ბარელი იდება grid-ზე; ზომბები მას ავლებენ გზას, დაჭიმულები კი ღრღნიან.
+              <b>დაუმიზნე და ესროლე</b> — აფეთქდება და გარშემო მთელ ხროვას ავიწროებს.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ GAME OVER ============ -->
+      <section class="panel" id="gameOverPanel" hidden>
+        <h1>MATCH OVER</h1>
+        <div class="recordBadge" id="recordBadge" hidden>★ NEW RECORD! ★</div>
+        <div id="summaryWrap"></div>
+        <button class="bigBtn" id="restartBtn">PLAY AGAIN</button>
+        <button class="bigBtn ghost" id="menuBtn">MENU</button>
+      </section>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

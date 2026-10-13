@@ -1,0 +1,20 @@
+{
+  "name": "@game-shoot/client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser client (Three.js top-down renderer + netcode)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11"
+  }
+}

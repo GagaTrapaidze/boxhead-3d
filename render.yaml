@@ -1,0 +1,19 @@
+# Render Blueprint — one free Node web service for the authoritative game server.
+# The Three.js client deploys separately on Vercel (see vercel.json).
+#
+# Render injects PORT automatically; the server reads it in src/index.ts.
+# Deploy: Render Dashboard → New → Blueprint → pick this repo.
+services:
+  - type: web
+    name: game-shoot-server
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build --workspace server
+    startCommand: npm run start --workspace server
+    healthCheckPath: /healthz
+    # Redeploy on every push to the linked branch (replaces the deprecated flag).
+    autoDeployTrigger: commit
+    envVars:
+      # The monorepo needs Node >= 22.6 (built-in TypeScript type stripping).
+      - key: NODE_VERSION
+        value: "22"

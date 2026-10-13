@@ -1,0 +1,16 @@
+{
+  "name": "@game-shoot/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Authoritative game server (Colyseus arrives in Phase 2)",
+  "scripts": {
+    "dev": "node --experimental-strip-types --watch src/index.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5"
+  }
+}
