@@ -48,12 +48,16 @@ npm run dev:client     # Vite dev server on :5173 — then press „დაწყ
 ### Online lobby checks
 
 ```bash
-# server-only: create → join-by-code → presence relay → host start
+# server-only: create → join → downed → 10 s respawn → Game Over → restart
 node scripts/lobby-check.mjs           # needs dev:server
 
-# two real browser tabs over CDP: create room, join by code, start, both in play
+# two real browser tabs over CDP: create room, join by code, start, downed
+# countdown, respawn, and Game Over reaching both clients
 node scripts/lobby-browser-check.mjs   # needs dev:server + dev:client
                                        #   + Chrome on --remote-debugging-port=9333
+
+# local 2-player downed → passive revive → Game Over (guards the local rules)
+node scripts/local-revive-check.mjs    # needs dev:client + Chrome on :9333
 ```
 
 ## Deployment (Render + Vercel)
@@ -129,6 +133,13 @@ and the server (`server/src/rooms/CoopRoom.ts`) hosts one room type, `coop`:
   peers render each other. `patchRate` is 50 ms.
 - **Host** → first player in; only the host may `start`, which flips the room to
   `playing` and every client launches the match in sync.
+- **Downed & respawn** → at 0 HP the client reports its death; the room marks
+  the player **downed** and runs a **10 s** clock (`alive` / `respawnTimer` in
+  the schema). When it expires and a teammate is still alive, the player
+  respawns at full HP at their seat's safe spawn. If every player is down at
+  once, the room sets `matchOver` → **Game Over** for everyone.
+- **Restart** → the host's restart resets every player to full HP and clears
+  Game Over.
 - **Reconnect** → an unexpected drop holds the seat for 30 s and the client
   reconnects with its reconnection token.
 

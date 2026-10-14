@@ -133,6 +133,7 @@ const powerTimeEl = byId('powerTime');
 const messageEl = byId('message');
 const flashEl = byId('flash');
 const reviveLabelEl = byId('reviveLabel');
+const mateLabelsWrap = byId('mateLabels');
 const comboBannerEl = byId('comboBanner');
 const eventBannerEl = byId('eventBanner');
 const waveTimerEl = byId('waveTimer');
@@ -465,9 +466,9 @@ function centroidOf(list: Player[]): { x: number; z: number } {
   return { x: x / list.length, z: z / list.length };
 }
 
-/** Copies a peer's synchronized presence onto its visual-only actor. */
+/** Copies a peer's synchronized presence + life state onto its visual actor. */
 function applyPresence(player: Player, presence: OnlinePlayer): void {
-  player.mesh.visible = presence.connected;
+  const wasDowned = player.downed;
   player.hp = presence.hp;
   player.x = presence.x;
   player.z = presence.z;
@@ -481,6 +482,21 @@ function applyPresence(player: Player, presence: OnlinePlayer): void {
     player.weapon = presence.weapon;
     updateWeaponMesh(player.mesh, player.weapon);
     player._lastWeaponId = player.weapon;
+  }
+
+  // Life state: a downed peer stays as a blinking ghost at their death spot
+  // (the blink loop owns `mesh.visible` until they respawn).
+  player.alive = presence.alive;
+  player.downed = !presence.alive;
+  player.reviveTimer = presence.respawnTimer;
+  if (!presence.connected) {
+    player.mesh.visible = false;
+  } else if (presence.alive) {
+    player.mesh.visible = true;
+    if (wasDowned) player.blinkTimer = COOP_CONFIG.blinkInterval; // just respawned
+  } else if (!wasDowned) {
+    player.mesh.visible = true; // just went down — begin the ghost blink
+    player.blinkTimer = COOP_CONFIG.blinkInterval;
   }
   syncActor(player);
 }
@@ -527,6 +543,116 @@ function publishPresence(): void {
   });
 }
 
+/**
+ * Online downed state: no action, ghost blink. The 10 s countdown is
+ * authoritative on the server and mirrored into `reviveTimer` each patch, so
+ * the client never runs its own revive math here.
+ */
+function enterOnlineDowned(player: Player): void {
+  player.hp = 0;
+  player.alive = false; // no targeting, damage or pickups
+  player.downed = true;
+  player.reviveTimer = COOP_CONFIG.reviveCountdown;
+  player.reviveHold = 0;
+  player.blinkTimer = COOP_CONFIG.blinkInterval;
+  player.mesh.visible = true; // ghost blinks at the death spot
+  toast(`დაეცი! · აღდგენა ${COOP_CONFIG.reviveCountdown}s-ში`, 2.5);
+}
+
+/** Ghost blink for a downed player (online); the server owns the timer. */
+function tickOnlineDowned(player: Player, dt: number): void {
+  player.blinkTimer -= dt;
+  if (player.blinkTimer <= 0) {
+    player.mesh.visible = !player.mesh.visible;
+    player.blinkTimer = COOP_CONFIG.blinkInterval;
+  }
+}
+
+/** Mirrors the server's life state onto the one locally-simulated player. */
+function syncLocalPlayer(info: RoomInfo): void {
+  const local = players[0];
+  const me = info.players.find((p) => p.sessionId === info.selfId);
+  if (!local || !me) return;
+
+  local.reviveTimer = me.respawnTimer;
+  if (!me.alive) {
+    if (!local.downed) enterOnlineDowned(local);
+    local.hp = 0;
+    return;
+  }
+  if (local.downed) respawnLocalPlayer(local, me);
+}
+
+/** Revives the local player at the server-authored safe spawn, full HP/Pistol. */
+function respawnLocalPlayer(local: Player, presence: OnlinePlayer): void {
+  local.downed = false;
+  local.alive = true;
+  local.hp = PLAYER_MAX_HP;
+  local.x = presence.x;
+  local.z = presence.z;
+  local.aimX = 1;
+  local.aimZ = 0;
+  local.facing = Math.atan2(local.aimX, local.aimZ);
+  local.invulnTimer = COOP_CONFIG.reviveInvulnerability;
+  local.blinkTimer = COOP_CONFIG.invulnBlinkInterval;
+  local.reviveTimer = 0;
+  local.reviveHold = 0;
+  local.recoil = 0;
+  // Inventory reset: starter Pistol only (matches the local co-op revive).
+  local.ammo.clear();
+  local.granted.clear();
+  local.weapon = WeaponId.Pistol;
+  updateWeaponMesh(local.mesh, WeaponId.Pistol);
+  local._lastWeaponId = WeaponId.Pistol;
+  local.mesh.visible = true;
+  syncActor(local);
+  toast(`აღდგენილი ხარ! · ${COOP_CONFIG.reviveInvulnerability}s უვნებლობა`, 2.5);
+}
+
+/** Projects a world point to screen pixels (reuses the scratch vector). */
+function projectToScreen(x: number, y: number, z: number): { left: number; top: number } {
+  REPROJECT.set(x, y, z);
+  world.camera.updateMatrixWorld();
+  REPROJECT.project(world.camera);
+  return {
+    left: (REPROJECT.x * 0.5 + 0.5) * window.innerWidth,
+    top: (-REPROJECT.y * 0.5 + 0.5) * window.innerHeight,
+  };
+}
+
+/** Pooled countdown labels stacked above downed teammates' bodies. */
+const mateLabelPool: HTMLDivElement[] = [];
+function mateLabelAt(index: number): HTMLDivElement {
+  let label = mateLabelPool[index];
+  if (!label) {
+    label = document.createElement('div');
+    label.className = 'mateLabel';
+    mateLabelsWrap.append(label);
+    mateLabelPool[index] = label;
+  }
+  return label;
+}
+
+/** Shows each downed teammate's respawn countdown above their body. */
+function updateMateLabels(): void {
+  for (let i = 0; i < remotePlayers.length; i++) {
+    const remote = remotePlayers[i];
+    const label = mateLabelAt(i);
+    if (!remote.downed) {
+      label.hidden = true;
+      continue;
+    }
+    const pos = projectToScreen(remote.x, 2.2, remote.z);
+    label.hidden = false;
+    label.textContent = `REVIVING IN: ${Math.max(1, Math.ceil(remote.reviveTimer))}s`;
+    label.style.left = `${pos.left.toFixed(1)}px`;
+    label.style.top = `${pos.top.toFixed(1)}px`;
+  }
+  for (let i = remotePlayers.length; i < mateLabelPool.length; i++) {
+    mateLabelPool[i].hidden = true;
+  }
+}
+
 /** Launches an online match from a room snapshot (host and joiners alike). */
 function startOnlineMatch(info: RoomInfo): void {
   lastMapId = info.mapId;
@@ -560,11 +686,19 @@ function startOnlineMatch(info: RoomInfo): void {
   toast(`ონლაინ მატჩი — ${currentMap.name}`, 3);
 }
 
-/** Renders lobby UI and keeps peer actors in sync with the live room state. */
+/** Renders lobby UI and keeps actors/game-over in sync with the live room state. */
 function handleRoomUpdate(info: RoomInfo | null): void {
   onlineInfo = info;
   setRoomInfo(info);
-  if (info && isOnline && phase === 'playing') syncRemotePlayers(info);
+  if (!info || !isOnline || phase !== 'playing') return;
+
+  // The server declares Game Over the moment every player is down at once.
+  if (info.matchOver) {
+    endGame();
+    return;
+  }
+  syncRemotePlayers(info);
+  syncLocalPlayer(info);
 }
 
 /** Builds the lobby client that drives the online panel and match start. */
@@ -629,7 +763,8 @@ function backToMenu(): void {
 initMenu({
   onStart: (startMode, mapId) => startGame(startMode, mapId),
   onRestart: () => {
-    if (isOnline && onlineInfo) startOnlineMatch(onlineInfo);
+    // Online: ask the server to reset the room (host-only) and restart everyone.
+    if (isOnline && onlineLobby) onlineLobby.requestRestart();
     else startGame(lastMode, lastMapId);
   },
   onMenu: () => backToMenu(),
@@ -1096,6 +1231,14 @@ function applyDamage(player: Player, amount: number): void {
   flashDamage();
   if (player.hp > 0) return;
 
+  // Online: the room owns life/death — enter the local downed state and report
+  // the death so the server starts the 10 s respawn clock (or Game Over).
+  if (isOnline) {
+    enterOnlineDowned(player);
+    onlineLobby?.reportDeath();
+    return;
+  }
+
   // Local co-op: with a living partner, dropping to 0 HP begins the 10 s
   // downed/revive countdown instead of ending the game. If no partner is
   // alive (solo, or both died together) it's Game Over immediately.
@@ -1258,7 +1401,12 @@ function update(dt: number, nowMs: number): void {
 
   for (const player of players) {
     if (player.downed) {
-      // ghost blink + passive countdown + active circle hold
+      // Online: the server owns the countdown — just blink and wait.
+      if (isOnline) {
+        tickOnlineDowned(player, dt);
+        continue;
+      }
+      // Local co-op: ghost blink + passive countdown + active circle hold.
       const partnerInCircle = players.some(
         (other) =>
           other !== player &&
@@ -1308,6 +1456,13 @@ function update(dt: number, nowMs: number): void {
     decayRecoil(player, dt);
     syncActor(player);
     if (inp.shooting(player.index)) tryFire(player, nowMs);
+  }
+
+  // Downed teammates blink in place (the local downed player is handled above).
+  if (isOnline) {
+    for (const remote of remotePlayers) {
+      if (remote.downed) tickOnlineDowned(remote, dt);
+    }
   }
 
   cameraPlayers.length = 0;
@@ -1448,6 +1603,7 @@ function update(dt: number, nowMs: number): void {
   } else {
     reviveLabelEl.hidden = true;
   }
+  updateMateLabels(); // respawn countdowns above downed teammates
 
   // Minimal retro intermission countdown, pinned top-centre and hidden the
   // moment the wave starts spawning.

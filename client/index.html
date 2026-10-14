@@ -133,6 +133,14 @@
         white-space: nowrap;
       }
       #reviveLabel[hidden] { display: none; }
+      /* Respawn countdowns stacked above downed *teammates'* bodies. */
+      #mateLabels { position: fixed; inset: 0; z-index: 7; pointer-events: none; }
+      .mateLabel {
+        position: fixed; transform: translate(-50%, -100%);
+        color: #ffd35c; font-size: 15px; font-weight: 800; letter-spacing: 1px;
+        text-shadow: 0 1px 6px rgba(0,0,0,.95); white-space: nowrap;
+      }
+      .mateLabel[hidden] { display: none; }
       #flash {
         position: fixed; inset: 0; z-index: 4; pointer-events: none; opacity: 0;
         transition: opacity .12s ease-out;
@@ -363,6 +371,7 @@
     <div id="comboBanner" hidden></div>
     <div id="eventBanner" hidden></div>
     <div id="reviveLabel" hidden>REVIVING IN: 10s</div>
+    <div id="mateLabels"></div>
 
     <div id="overlay">
       <!-- ============ START MENU ============ -->

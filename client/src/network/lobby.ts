@@ -31,6 +31,10 @@ export interface OnlinePlayer {
   name: string;
   seat: number;
   connected: boolean;
+  /** Server-authoritative life state: false = downed, awaiting respawn. */
+  alive: boolean;
+  /** Seconds left on this player's respawn countdown (0 while alive). */
+  respawnTimer: number;
   x: number;
   z: number;
   aimX: number;
@@ -49,6 +53,8 @@ export interface RoomInfo {
   /** This client's sessionId. */
   selfId: string;
   isHost: boolean;
+  /** True once every player is down at once — Game Over for the whole room. */
+  matchOver: boolean;
   /** Players ordered by seat (index 0 first). */
   players: OnlinePlayer[];
 }
@@ -79,6 +85,8 @@ interface RawPlayer {
   name: string;
   seat: number;
   connected: boolean;
+  alive: boolean;
+  respawnTimer: number;
   x: number;
   z: number;
   aimX: number;
@@ -92,6 +100,7 @@ interface RawState {
   hostId: string;
   mapId: string;
   phase: string;
+  matchOver: boolean;
   players: {
     size: number;
     forEach: (callback: (player: RawPlayer, key: string) => void) => void;
@@ -176,6 +185,19 @@ export class Lobby {
     this.room?.send('start');
   }
 
+  /**
+   * Host only: (re)starts the match. The server resets every player to full
+   * health and clears Game Over, so this doubles as the "Play Again" action.
+   */
+  requestRestart(): void {
+    this.room?.send('start');
+  }
+
+  /** Reports the local player's HP hitting 0 — starts the server respawn clock. */
+  reportDeath(): void {
+    this.room?.send('death');
+  }
+
   /** Host only, lobby only: changes the arena everyone will play. */
   setMap(mapId: string): void {
     this.room?.send('setMap', { mapId });
@@ -230,9 +252,12 @@ export class Lobby {
     if (!room) return;
     const info = this.buildInfo(room);
     this.handlers.onRoom(info);
-    if (info.phase === 'playing' && !this.started) {
+    if (info.phase === 'playing' && !info.matchOver && !this.started) {
       this.started = true;
       this.handlers.onStart(info);
+    } else if (info.phase !== 'playing' || info.matchOver) {
+      // Not live (lobby, or Game Over) — arm a fresh start when the host restarts.
+      this.started = false;
     }
   }
 
@@ -271,6 +296,8 @@ export class Lobby {
         name: player.name,
         seat: player.seat,
         connected: player.connected,
+        alive: player.alive !== false,
+        respawnTimer: player.respawnTimer ?? 0,
         x: player.x,
         z: player.z,
         aimX: player.aimX,
@@ -289,6 +316,7 @@ export class Lobby {
       phase,
       selfId: room.sessionId,
       isHost: state.hostId === room.sessionId,
+      matchOver: state.matchOver === true,
       players,
     };
   }

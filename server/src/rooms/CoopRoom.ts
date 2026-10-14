@@ -25,6 +25,7 @@ import {
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
 } from '../../../shared/src/constants.ts';
+import { COOP_CONFIG } from '../../../shared/src/balance.config.ts';
 import { DEFAULT_MAP_ID, getMap } from '../../../shared/src/maps.ts';
 
 /** One player's synchronized presence inside the room. */
@@ -35,6 +36,10 @@ export const PlayerPresence = schema(
     seat: 'uint8',
     /** false while the player is inside their reconnection grace window. */
     connected: 'boolean',
+    /** Server-authoritative life state: false = downed, awaiting respawn. */
+    alive: 'boolean',
+    /** Seconds left before this downed player respawns (0 while alive). */
+    respawnTimer: 'float32',
     x: 'float32',
     z: 'float32',
     aimX: 'float32',
@@ -56,6 +61,8 @@ export const CoopRoomState = schema(
     mapId: 'string',
     /** 'lobby' until the host starts; 'playing' once the match has begun. */
     phase: 'string',
+    /** true once every player is down at once — Game Over for the whole room. */
+    matchOver: 'boolean',
     players: { map: PlayerPresence },
   },
   'CoopRoomState'
@@ -119,6 +126,7 @@ export class CoopRoom extends Room {
     this.state.code = this.roomId;
     this.state.hostId = '';
     this.state.phase = 'lobby';
+    this.state.matchOver = false;
     this.state.mapId = getMap(options.mapId ?? DEFAULT_MAP_ID).id;
 
     // Metadata lets future matchmaking queries (and dashboards) find the room
@@ -128,7 +136,8 @@ export class CoopRoom extends Room {
     // --- presence: high-frequency transform relay, no schema round-trip -------
     this.onMessage('presence', (client: Client, msg: Record<string, unknown>) => {
       const player = this.state.players.get(client.sessionId);
-      if (!player || this.state.phase !== 'playing') return;
+      // Downed players are frozen at their death spot until respawn.
+      if (!player || this.state.phase !== 'playing' || !player.alive) return;
       player.x = clamp(msg?.x, -512, 512, player.x);
       player.z = clamp(msg?.z, -512, 512, player.z);
       player.aimX = clamp(msg?.aimX, -1, 1, player.aimX);
@@ -144,14 +153,99 @@ export class CoopRoom extends Room {
       this.state.mapId = getMap(msg?.mapId ?? DEFAULT_MAP_ID).id;
     });
 
-    // --- start: host-only, from the lobby ------------------------------------
+    // --- start / restart: host-only, resets every player to full ------------
     this.onMessage('start', (client: Client) => {
       if (client.sessionId !== this.state.hostId) return;
-      if (this.state.phase !== 'lobby') return;
+      if (this.state.phase === 'playing' && !this.state.matchOver) return; // already live
       if (this.state.players.size < 1) return;
-      this.state.phase = 'playing';
-      this.setMetadata({ code: this.state.code, mapId: this.state.mapId, phase: 'playing' });
+      this.beginMatch();
     });
+
+    // --- death: a client reports its own local player reached 0 HP ----------
+    this.onMessage('death', (client: Client) => {
+      if (this.state.phase !== 'playing' || this.state.matchOver) return;
+      const player = this.state.players.get(client.sessionId);
+      if (!player || !player.alive) return;
+      player.alive = false;
+      player.hp = 0;
+      player.respawnTimer = COOP_CONFIG.reviveCountdown;
+      // Schema fields (alive/respawnTimer/matchOver) carry all of this to peers.
+      this.checkGameOver();
+    });
+
+    // Responsive respawn clock — ticks the 10 s countdown independently of the
+    // 50 ms state patch rate, so a timer crossing zero flips `alive` promptly.
+    this.setSimulationInterval((deltaMs: number) => this.tickRespawns(deltaMs), 100);
+  }
+
+  /** Resets the room to a fresh, fully-alive match (initial start and restart). */
+  private beginMatch(): void {
+    this.state.phase = 'playing';
+    this.state.matchOver = false;
+    this.state.players.forEach((player) => {
+      player.alive = true;
+      player.hp = PLAYER_MAX_HP;
+      player.respawnTimer = 0;
+    });
+    this.setMetadata({ code: this.state.code, mapId: this.state.mapId, phase: 'playing' });
+  }
+
+  /**
+   * One respawn-clock tick: advance every downed player's countdown and revive
+   * anyone whose 10 s lapses while at least one teammate is still alive. If no
+   * teammate is alive the room is already over (see {@link checkGameOver}), so
+   * respawns simply never fire in that state.
+   */
+  private tickRespawns(deltaMs: number): void {
+    if (this.state.phase !== 'playing' || this.state.matchOver) return;
+    const dt = deltaMs / 1000;
+    this.state.players.forEach((player) => {
+      if (player.alive) return;
+      player.respawnTimer = Math.max(0, player.respawnTimer - dt);
+      if (player.respawnTimer > 0) return;
+      if (!this.anyTeammateAlive(player)) return;
+      this.respawnPlayer(player);
+    });
+  }
+
+  /** Revives one player at full health, back at their seat's authored spawn. */
+  private respawnPlayer(player: PlayerPresence): void {
+    const spawn = this.spawnForSeat(player.seat);
+    player.alive = true;
+    player.hp = PLAYER_MAX_HP;
+    player.respawnTimer = 0;
+    player.x = spawn.x;
+    player.z = spawn.z;
+    player.aimX = 1;
+    player.aimZ = 0;
+  }
+
+  /** True while at least one *other* player is still alive. */
+  private anyTeammateAlive(player: PlayerPresence): boolean {
+    let alive = false;
+    this.state.players.forEach((other) => {
+      if (other !== player && other.alive) alive = true;
+    });
+    return alive;
+  }
+
+  /** Game Over for the whole room the instant no player is left alive. */
+  private checkGameOver(): void {
+    if (this.state.matchOver) return;
+    let anyAlive = false;
+    this.state.players.forEach((player) => {
+      if (player.alive) anyAlive = true;
+    });
+    if (!anyAlive) {
+      this.state.matchOver = true;
+    }
+  }
+
+  /** A seat's safe spawn point from the active map's authored spawn list. */
+  private spawnForSeat(seat: number): { x: number; z: number } {
+    const spawns = getMap(this.state.mapId).playerSpawns;
+    const slot = spawns[seat % spawns.length];
+    return { x: slot.x, z: slot.y };
   }
 
   override onJoin(client: Client, options: CoopJoinOptions = {}): void {
@@ -160,6 +254,8 @@ export class CoopRoom extends Room {
     player.name = sanitizeName(options.name);
     player.seat = seat;
     player.connected = true;
+    player.alive = true;
+    player.respawnTimer = 0;
     player.x = 0;
     player.z = 0;
     player.aimX = 1;

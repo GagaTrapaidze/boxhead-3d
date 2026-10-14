@@ -94,6 +94,50 @@ try {
   assert(relayed.x === 12.5 && relayed.hp === 80 && relayed.weapon === 2, 'presence relayed to peer');
   assert(guestId !== undefined, 'guest has a distinct session id');
 
+  // --- downed + 10 s respawn (guest stays alive) --------------------------
+  hostRoom.send('death');
+  await waitFor(guestRoom, (s) => s.players.get(hostId)?.alive === false, 'host downed (peer view)');
+  assert(guestRoom.state.players.get(hostId).alive === false, 'peer sees teammate downed');
+  assert(guestRoom.state.matchOver === false, 'match continues while a teammate lives');
+  const downTimer = guestRoom.state.players.get(hostId).respawnTimer;
+  assert(downTimer > 8 && downTimer <= 10, `respawn timer starts near 10s (${downTimer.toFixed(1)}s)`);
+
+  const respawned = await waitFor(
+    guestRoom,
+    (s) => s.players.get(hostId)?.alive === true,
+    'host respawn after 10s',
+    13000
+  );
+  assert(respawned.players.get(hostId).hp === 100, 'respawned at full health');
+  assert(
+    typeof respawned.players.get(hostId).x === 'number',
+    'respawned at a spawn position from the server'
+  );
+
+  // --- Game Over: every player down at once -------------------------------
+  hostRoom.send('death');
+  guestRoom.send('death');
+  await waitFor(hostRoom, (s) => s.matchOver === true, 'game over');
+  assert(hostRoom.state.matchOver === true, 'all players down → Game Over (host view)');
+  await waitFor(guestRoom, (s) => s.matchOver === true, 'guest game over');
+  assert(guestRoom.state.matchOver === true, 'Game Over mirrored to peers');
+
+  // No respawns fire after Game Over.
+  await new Promise((r) => setTimeout(r, 400));
+  assert(
+    [...hostRoom.state.players.values()].every((p) => p.alive === false),
+    'no respawns after Game Over'
+  );
+
+  // --- host restart resets every player -----------------------------------
+  hostRoom.send('start');
+  const restarted = await waitFor(guestRoom, (s) => s.matchOver === false, 'restart');
+  assert(restarted.matchOver === false, 'host restart clears Game Over');
+  assert(
+    [...restarted.players.values()].every((p) => p.alive === true && p.hp === 100),
+    'restart revives everyone at full health'
+  );
+
   console.log('[lobby-check] PASS');
 } catch (error) {
   console.error('[lobby-check] FAIL:', error?.message ?? error);

@@ -183,6 +183,51 @@ try {
   assert(sceneHost.players === 1 && sceneGuest.players === 1, 'each client controls exactly one local player');
   assert(sceneHost.remotes === 1 && sceneGuest.remotes === 1, 'each client renders one remote peer');
 
+  // --- downed → teammate countdown → 10 s respawn -------------------------
+  await host.evaluate(`globalThis.__game_shoot.damagePlayer(0, 9999)`);
+  const downed = await host.poll(
+    `JSON.stringify({ phase: globalThis.__game_shoot.phase, downed: globalThis.__game_shoot.players[0].downed })`,
+    (o) => o.downed === true,
+    'local player downed'
+  );
+  assert(downed.phase === 'playing', 'room stays live while a teammate is alive');
+
+  await guest.poll(
+    `JSON.stringify({ labels: [...document.querySelectorAll('.mateLabel')]
+      .filter((el) => !el.hidden).map((el) => el.textContent) })`,
+    (o) => o.labels.some((text) => /REVIVING IN/.test(text)),
+    'teammate respawn countdown'
+  );
+  assert(true, "downed player's countdown is visible to the teammate");
+
+  const revived = await host.poll(
+    `JSON.stringify({ alive: globalThis.__game_shoot.players[0].alive, hp: globalThis.__game_shoot.players[0].hp })`,
+    (o) => o.alive === true,
+    'respawn after 10s',
+    15000
+  );
+  assert(revived.hp === 100, 'respawned at full health');
+
+  // --- Game Over when every player is down at once ------------------------
+  // Clear the post-respawn i-frames directly: headless throttles a background
+  // tab's rAF, so relying on their 2 s decay would be flaky (not what we test).
+  await host.evaluate(
+    `globalThis.__game_shoot.players[0].invulnTimer = 0; globalThis.__game_shoot.damagePlayer(0, 9999)`
+  );
+  await guest.evaluate(
+    `globalThis.__game_shoot.players[0].invulnTimer = 0; globalThis.__game_shoot.damagePlayer(0, 9999)`
+  );
+  await host.poll(`JSON.stringify({ phase: globalThis.__game_shoot.phase })`, (o) => o.phase === 'over', 'host game over');
+  await guest.poll(`JSON.stringify({ phase: globalThis.__game_shoot.phase })`, (o) => o.phase === 'over', 'guest game over');
+  assert(true, 'Game Over reached on every client');
+
+  const overlay = JSON.parse(
+    await host.evaluate(
+      `JSON.stringify({ overlay: !document.getElementById('overlay').hidden, panel: !document.getElementById('gameOverPanel').hidden })`
+    )
+  );
+  assert(overlay.overlay && overlay.panel, 'Game Over screen shown to the player');
+
   if (host.errors.length || guest.errors.length) {
     throw new Error(`console errors: host=${JSON.stringify(host.errors)} guest=${JSON.stringify(guest.errors)}`);
   }
