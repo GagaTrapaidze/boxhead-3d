@@ -6,7 +6,9 @@
  */
 import { DEFAULT_MAP_ID, MAP_DEFINITIONS } from '../../../shared/src/maps.ts';
 import type { MapDefinition } from '../../../shared/src/maps.ts';
+import { MAX_PLAYERS } from '../../../shared/src/constants.ts';
 import { SERVER_URL } from '../network/serverUrl.ts';
+import type { ConnectionState, RoomInfo } from '../network/lobby.ts';
 
 export type StartMode = 'single' | 'duo';
 
@@ -14,6 +16,14 @@ export interface MenuHandlers {
   onStart: (mode: StartMode, mapId: string) => void;
   onRestart: () => void;
   onMenu: () => void;
+  /** "Create Room" — host a new online room seeded with the chosen map. */
+  onCreateRoom: (name: string, mapId: string) => void;
+  /** "Join" — connect to an existing room by its 6-char code. */
+  onJoinRoom: (code: string, name: string) => void;
+  /** Host pressed "Start Match". */
+  onStartOnline: () => void;
+  /** The player left the online room. */
+  onLeaveOnline: () => void;
 }
 
 /** One player's contribution, rendered as a column of the summary table. */
@@ -115,6 +125,25 @@ function buildMapCards(): void {
 export function initMenu(handlers: MenuHandlers): void {
   buildMapCards();
   const onlinePanel = byId('onlinePanel');
+  const onlineNote = byId('onlineNote');
+  const playerName = byId<HTMLInputElement>('playerName');
+  const roomCode = byId<HTMLInputElement>('roomCode');
+
+  // Remember the player's display name across visits.
+  const NAME_KEY = 'boxhead.playerName';
+  const persistName = (): void => {
+    try {
+      window.localStorage.setItem(NAME_KEY, playerName.value.trim());
+    } catch {
+      /* storage unavailable — the name just won't persist */
+    }
+  };
+  try {
+    playerName.value = window.localStorage.getItem(NAME_KEY) ?? '';
+  } catch {
+    /* storage unavailable */
+  }
+  const chosenName = (): string => playerName.value.trim() || 'Player';
 
   document.querySelectorAll<HTMLButtonElement>('.modeBtn').forEach((button) => {
     const mode = button.dataset.mode;
@@ -130,19 +159,40 @@ export function initMenu(handlers: MenuHandlers): void {
         hideOverlay();
         handlers.onStart(mode, selectedMapId);
       } else {
-        // "Online Multiplayer" — reveal the room-code panel (server is Phase 2)
+        // "Online Multiplayer" — reveal the room/connection panel. Only reset
+        // the status line when we're not already inside a room (the connect
+        // controls are hidden once a room is joined).
         onlinePanel.hidden = !onlinePanel.hidden;
+        if (!onlinePanel.hidden && !playerName.hidden) {
+          setOnlineStatus('idle', `სერვერი: ${SERVER_URL}`);
+        }
       }
     });
   });
 
-  byId('joinRoom').addEventListener('click', () => {
-    byId('onlineNote').textContent =
-      `ონლაინი ჯერ არ მუშაობს — სერვერი/ლობი დაემატება Phase 2-ში (ოთახის კოდით). სერვერი: ${SERVER_URL}`;
-  });
   byId('createRoom').addEventListener('click', () => {
-    byId('onlineNote').textContent =
-      `ოთახის შქმნა სერვერს საჭიროებს — დაელოდე Phase 2-ს (Colyseus ლობი). სერვერი: ${SERVER_URL}`;
+    persistName();
+    handlers.onCreateRoom(chosenName(), selectedMapId);
+  });
+  byId('joinRoom').addEventListener('click', () => {
+    persistName();
+    handlers.onJoinRoom(roomCode.value.trim().toUpperCase(), chosenName());
+  });
+  // Room codes are uppercase A–Z / 2–9 (no ambiguous glyphs).
+  roomCode.addEventListener('input', () => {
+    roomCode.value = roomCode.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  });
+  roomCode.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') byId('joinRoom').click();
+  });
+  byId('startMatch').addEventListener('click', () => handlers.onStartOnline());
+  byId('leaveRoom').addEventListener('click', () => handlers.onLeaveOnline());
+  byId('copyCode').addEventListener('click', () => {
+    const code = byId('roomCodeDisplay').textContent ?? '';
+    navigator.clipboard?.writeText(code).then(
+      () => setOnlineStatus('connected', `კოდი დაკოპირებულია: ${code}`),
+      () => setOnlineStatus('connected', `ოთახის კოდი: ${code}`)
+    );
   });
 
   byId('restartBtn').addEventListener('click', () => {
@@ -153,6 +203,74 @@ export function initMenu(handlers: MenuHandlers): void {
     showMenu();
     handlers.onMenu();
   });
+}
+
+/**
+ * Renders the connection status line and toggles the connect buttons while a
+ * connection attempt is in flight. Called by main.ts from the Lobby handlers.
+ */
+export function setOnlineStatus(state: ConnectionState, message: string): void {
+  const note = byId('onlineNote');
+  note.textContent = message || `სერვერი: ${SERVER_URL}`;
+  note.classList.toggle('error', state === 'error');
+  const busy = state === 'connecting';
+  byId<HTMLButtonElement>('createRoom').disabled = busy;
+  byId<HTMLButtonElement>('joinRoom').disabled = busy;
+}
+
+/**
+ * Renders the online room lobby from a synchronized room snapshot (or hides it
+ * and restores the connect controls when `info` is null).
+ */
+export function setRoomInfo(info: RoomInfo | null): void {
+  const showConnect = info === null;
+  byId('playerName').hidden = !showConnect;
+  byId('roomCode').hidden = !showConnect;
+  byId('joinRoom').hidden = !showConnect;
+  byId('createRoom').hidden = !showConnect;
+
+  byId('roomLobby').hidden = info === null;
+  if (!info) return;
+
+  byId('roomCodeDisplay').textContent = info.code;
+  byId('roomCount').textContent = `${info.players.length}/${MAX_PLAYERS}`;
+
+  const startBtn = byId<HTMLButtonElement>('startMatch');
+  startBtn.hidden = !info.isHost;
+  startBtn.disabled = info.phase !== 'lobby';
+
+  const list = byId('roomPlayers');
+  list.innerHTML = '';
+  if (info.players.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'empty';
+    empty.textContent = 'მოთამაშეები ჯერ არ არიან';
+    list.append(empty);
+    return;
+  }
+  for (const player of info.players) {
+    const item = document.createElement('li');
+    if (player.sessionId === info.hostId) item.classList.add('host');
+    if (!player.connected) item.classList.add('away');
+
+    const who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = `${player.seat + 1}. ${player.name}`;
+
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent =
+      player.sessionId === info.selfId
+        ? 'შენ'
+        : player.sessionId === info.hostId
+          ? 'ჰოსტი'
+          : player.connected
+            ? ''
+            : 'კავშირი გაწყდა';
+
+    item.append(who, tag);
+    list.append(item);
+  }
 }
 
 export function hideOverlay(): void {

@@ -1,19 +1,29 @@
-// Phase 0 scaffold: dependency-free HTTP server so the workspace runs before
-// any package is installed. The Colyseus room/tick loop lands in Phase 2.
-//
-// Deploy notes (Render):
-//   · PORT is injected by the platform — never hard-code it.
-//   · CORS is intentionally wide open: the client is served from a different
-//     origin (Vercel) and Phase 2's matchmaking calls will need it too.
+/**
+ * Authoritative game server (Phase 2 — Colyseus lobby).
+ *
+ * Boots a Colyseus `Server` over the WebSocket transport and the `CoopRoom`
+ * matchmaking room, then keeps the Phase 0 `/healthz` probe alive so Render's
+ * health check (and the client) can verify the process.
+ *
+ * Deploy notes (Render):
+ *   · PORT is injected by the platform — never hard-code it.
+ *   · CORS stays wide open: the client is served from a different origin
+ *     (Vercel) and the Colyseus matchmaking HTTP calls need it.
+ */
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Server } from 'colyseus';
+import { WebSocketTransport } from '@colyseus/ws-transport';
+
 import {
+  COOP_ROOM_NAME,
   MAX_PLAYERS,
   MAX_ZOMBIES,
   SNAPSHOT_RATE,
   TICK_MS,
   TICK_RATE,
 } from '../../shared/src/constants.ts';
+import { CoopRoom } from './rooms/CoopRoom.ts';
 
 // Render (and most PaaS) set PORT; 2567 is the local / Colyseus convention.
 const port = Number(process.env.PORT) || 2567;
@@ -31,8 +41,10 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
   response.end(JSON.stringify(body));
 }
 
-const server = createServer((request: IncomingMessage, response: ServerResponse) => {
-  // CORS preflight — answer before routing so cross-origin POSTs can be probed.
+// Plain-HTTP surface: the health probe and a small info document. Colyseus
+// wraps this server and claims the matchmaking routes; everything else falls
+// through to the handler below.
+const httpServer = createServer((request: IncomingMessage, response: ServerResponse) => {
   if (request.method === 'OPTIONS') {
     response.writeHead(204, CORS_HEADERS);
     response.end();
@@ -44,6 +56,8 @@ const server = createServer((request: IncomingMessage, response: ServerResponse)
   if (path === '/healthz') {
     sendJson(response, 200, {
       ok: true,
+      phase: 'colyseus-lobby',
+      room: COOP_ROOM_NAME,
       tickRate: TICK_RATE,
       tickMs: TICK_MS,
       snapshotRate: SNAPSHOT_RATE,
@@ -58,7 +72,8 @@ const server = createServer((request: IncomingMessage, response: ServerResponse)
     sendJson(response, 200, {
       service: 'game-shoot-server',
       status: 'ok',
-      phase: 'scaffold',
+      phase: 'colyseus-lobby',
+      room: COOP_ROOM_NAME,
       health: '/healthz',
     });
     return;
@@ -68,7 +83,21 @@ const server = createServer((request: IncomingMessage, response: ServerResponse)
   response.end('not found — try /healthz\n');
 });
 
-server.listen(port, () => {
-  console.log(`[server] Phase 0 scaffold listening on http://localhost:${port}`);
-  console.log(`[server] sim ${TICK_RATE} Hz (${TICK_MS.toFixed(2)} ms/tick), snapshots ${SNAPSHOT_RATE} Hz`);
+const gameServer = new Server({
+  transport: new WebSocketTransport({ server: httpServer }),
 });
+
+// One room type for now: the co-op survival lobby/game room.
+gameServer.define(COOP_ROOM_NAME, CoopRoom);
+
+gameServer
+  .listen(port)
+  .then(() => {
+    console.log(`[server] Colyseus lobby listening on http://localhost:${port}`);
+    console.log(`[server] room "${COOP_ROOM_NAME}" · sim ${TICK_RATE} Hz · snapshots ${SNAPSHOT_RATE} Hz`);
+    console.log(`[server] health: http://localhost:${port}/healthz`);
+  })
+  .catch((error: unknown) => {
+    console.error('[server] failed to start:', error);
+    process.exit(1);
+  });

@@ -43,6 +43,11 @@ export function isSnapshotTick(tick: number): boolean {
 // ---------------------------------------------------------------------------
 
 export const MAX_PLAYERS = 4;
+
+/** Public Colyseus room name used for matchmaking (see server/src/rooms/CoopRoom.ts). */
+export const COOP_ROOM_NAME = 'coop';
+
+/** Human-readable room-code length; the 6-char code doubles as the Colyseus roomId. */
 export const ROOM_CODE_LENGTH = 6;
 /** Crockford-ish alphabet: no 0/O, 1/I/L to keep codes readable aloud. */
 export const ROOM_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // 23 letters + 8 digits = 31

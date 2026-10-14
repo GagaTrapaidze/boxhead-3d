@@ -202,6 +202,43 @@
         background: #ffd35c; color: #0b0f1a; cursor: pointer;
       }
       #onlineNote { flex-basis: 100%; font-size: 13px; color: #ffd35c; }
+      #onlineNote:empty { display: none; }
+      #onlineNote.error { color: #ff7a7a; }
+      #onlinePanel input#playerName {
+        width: 170px; letter-spacing: 1px; text-transform: none;
+      }
+
+      /* ---------- Online room lobby (code + connected players) ---------- */
+      #roomLobby {
+        flex-basis: 100%; max-width: 520px; margin: 8px auto 0; text-align: left;
+        background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.12);
+        border-radius: 12px; padding: 14px 16px;
+      }
+      #roomLobby[hidden] { display: none; }
+      .roomCodeLine { font-size: 15px; margin-bottom: 12px; }
+      .roomCodeLine b {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 20px; letter-spacing: 4px; color: #7ce7a2;
+      }
+      .roomPlayersHead {
+        font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
+        color: #9dc6ff; margin-bottom: 6px;
+      }
+      .roomPlayersHead span { float: right; opacity: .7; }
+      #roomPlayers { list-style: none; margin-bottom: 12px; }
+      #roomPlayers li {
+        display: flex; justify-content: space-between; gap: 10px; font-size: 14px;
+        padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,.07);
+      }
+      #roomPlayers li .who { font-weight: 700; }
+      #roomPlayers li.host .who { color: #7ce7a2; }
+      #roomPlayers li.away { opacity: .45; }
+      #roomPlayers li .tag { font-size: 11px; opacity: .75; }
+      #roomPlayers .empty { opacity: .6; font-style: italic; }
+      #roomLobby .rowBtns { display: flex; gap: 8px; flex-wrap: wrap; }
+      #onlinePanel .ghostBtn {
+        background: transparent; color: #eaf2ff; border: 1px solid #3a4a6b;
+      }
 
       .infoGrid {
         display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -349,10 +386,25 @@
         </div>
 
         <div id="onlinePanel" hidden>
+          <input id="playerName" maxlength="14" placeholder="სახელი" autocomplete="off" />
           <input id="roomCode" maxlength="6" placeholder="კოდი" autocomplete="off" />
           <button id="joinRoom">შეერთი</button>
-          <button id="createRoom">ოთახის შქმნა</button>
-          <p id="onlineNote">ონლაინ რეჟიმი Phase 2-ში — სერვერი/ლობი ჯერ მზად არაა.</p>
+          <button id="createRoom">ოთახის შექმნა</button>
+
+          <div id="roomLobby" hidden>
+            <div class="roomCodeLine">
+              ოთახის კოდი: <b id="roomCodeDisplay">------</b>
+              <button id="copyCode" type="button" class="ghostBtn">კოპირება</button>
+            </div>
+            <div class="roomPlayersHead">მოთამაშეები <span id="roomCount">0/4</span></div>
+            <ul id="roomPlayers"></ul>
+            <div class="rowBtns">
+              <button id="startMatch" type="button" hidden>მატჩის დაწყება</button>
+              <button id="leaveRoom" type="button" class="ghostBtn">ოთახიდან გასვლა</button>
+            </div>
+          </div>
+
+          <p id="onlineNote">ონლაინ რეჟიმი: შექმენი ოთახი ან შეერთი კოდით.</p>
         </div>
 
         <!-- Pre-game map selection (cards are generated from MAP_DEFINITIONS). -->

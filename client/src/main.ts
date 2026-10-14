@@ -56,6 +56,7 @@ import {
   syncActor,
 } from './game/player.ts';
 import { updateWeaponMesh } from './game/actors.ts';
+import type { CharacterId } from './game/actors.ts';
 import type { Player } from './game/player.ts';
 import {
   RAPID_FIRE_INTERVAL_MS,
@@ -90,8 +91,17 @@ import type { PickupKind } from './game/actors.ts';
 import { FxLayer } from './game/fx.ts';
 import { GibLayer } from './game/gibs.ts';
 import { audio } from './game/audio.ts';
-import { initMenu, showMatchSummary, showMenu } from './ui/menu.ts';
+import {
+  hideOverlay,
+  initMenu,
+  setOnlineStatus,
+  setRoomInfo,
+  showMatchSummary,
+  showMenu,
+} from './ui/menu.ts';
 import type { MatchSummary, PlayerSummary, StartMode } from './ui/menu.ts';
+import { Lobby } from './network/lobby.ts';
+import type { OnlinePlayer, RoomInfo } from './network/lobby.ts';
 import { weaponIconSvg } from './ui/weaponIcons.ts';
 
 type Phase = 'menu' | 'playing' | 'over';
@@ -184,6 +194,19 @@ let score = 0;
 let currentMap: MapDefinition = getMap(DEFAULT_MAP_ID);
 /** Authored horde spawn points for the active map, in engine {x, z} form. */
 let zombieSpawnPoints: { x: number; z: number }[] = [];
+
+// --- online (Colyseus) state ------------------------------------------------
+/** True while the current match is an online room match. */
+let isOnline = false;
+/** Seat of the local player in the room (drives spawn placement + presence). */
+let localSeat = 0;
+/** Network-driven peer actors — visual only, never part of the local simulation. */
+let remotePlayers: Player[] = [];
+let remoteBySession = new Map<string, Player>();
+/** Scratch list for camera framing (rebuilt each frame; capacity is tiny). */
+const cameraPlayers: Player[] = [];
+let onlineLobby: Lobby | null = null;
+let onlineInfo: RoomInfo | null = null;
 
 let toastText = '';
 let toastTimer = 0;
@@ -365,15 +388,20 @@ function clearWorld(): void {
 
   for (const player of players) removePlayerMesh(world.scene, player);
   players = [];
+  for (const remote of remotePlayers) removePlayerMesh(world.scene, remote);
+  remotePlayers = [];
+  remoteBySession = new Map();
   score = 0;
   toastText = '';
   toastTimer = 0;
+  isOnline = false;
 }
 
 function startGame(selectedMode: StartMode, mapId: string = lastMapId): void {
   lastMode = selectedMode;
   lastMapId = mapId;
   mode = selectedMode;
+  isOnline = false; // local match — drop any online-only actors
   input?.dispose();
   input = new InputManager(mode);
 
@@ -414,6 +442,142 @@ function startGame(selectedMode: StartMode, mapId: string = lastMapId): void {
       : `P1 მწვანე · P2 ლურჯი — ${currentMap.name}`,
     3
   );
+}
+
+// --- online match -----------------------------------------------------------
+const CHARACTER_ORDER: CharacterId[] = ['bambo', 'bon', 'bind', 'bert'];
+
+/** Spawn point for a seat, wrapping across the map's authored spawn slots. */
+function spawnForSeat(seat: number): { x: number; z: number } {
+  const spawns = currentMap.playerSpawns;
+  const slot = spawns[seat % spawns.length];
+  return { x: slot.x, z: slot.y };
+}
+
+function centroidOf(list: Player[]): { x: number; z: number } {
+  if (list.length === 0) return { x: 0, z: 0 };
+  let x = 0;
+  let z = 0;
+  for (const player of list) {
+    x += player.x;
+    z += player.z;
+  }
+  return { x: x / list.length, z: z / list.length };
+}
+
+/** Copies a peer's synchronized presence onto its visual-only actor. */
+function applyPresence(player: Player, presence: OnlinePlayer): void {
+  player.mesh.visible = presence.connected;
+  player.hp = presence.hp;
+  player.x = presence.x;
+  player.z = presence.z;
+  const length = Math.hypot(presence.aimX, presence.aimZ);
+  if (length > 1e-4) {
+    player.aimX = presence.aimX / length;
+    player.aimZ = presence.aimZ / length;
+    player.facing = Math.atan2(player.aimX, player.aimZ);
+  }
+  if (player.weapon !== presence.weapon) {
+    player.weapon = presence.weapon;
+    updateWeaponMesh(player.mesh, player.weapon);
+    player._lastWeaponId = player.weapon;
+  }
+  syncActor(player);
+}
+
+/** Adds, updates and removes remote peer actors to match the room's player list. */
+function syncRemotePlayers(info: RoomInfo): void {
+  const seen = new Set<string>();
+  for (const peer of info.players) {
+    if (peer.sessionId === info.selfId) continue;
+    seen.add(peer.sessionId);
+    let remote = remoteBySession.get(peer.sessionId);
+    if (!remote) {
+      remote = createPlayer(
+        world.scene,
+        0,
+        CHARACTER_ORDER[peer.seat % CHARACTER_ORDER.length],
+        spawnForSeat(peer.seat)
+      );
+      remoteBySession.set(peer.sessionId, remote);
+      remotePlayers.push(remote);
+    }
+    applyPresence(remote, peer);
+  }
+  for (const [sessionId, remote] of [...remoteBySession]) {
+    if (seen.has(sessionId)) continue; // still connected
+    removePlayerMesh(world.scene, remote);
+    remoteBySession.delete(sessionId);
+    const index = remotePlayers.indexOf(remote);
+    if (index >= 0) remotePlayers.splice(index, 1);
+  }
+}
+
+/** Sends the local player's transform to the room (~20 Hz, throttled inside). */
+function publishPresence(): void {
+  const local = players[0];
+  if (!local || !onlineLobby) return;
+  onlineLobby.sendPresence({
+    x: local.x,
+    z: local.z,
+    aimX: local.aimX,
+    aimZ: local.aimZ,
+    hp: Math.round(local.hp),
+    weapon: local.weapon,
+  });
+}
+
+/** Launches an online match from a room snapshot (host and joiners alike). */
+function startOnlineMatch(info: RoomInfo): void {
+  lastMapId = info.mapId;
+  mode = 'single'; // the local player uses the solo keyboard scheme
+  input?.dispose();
+  input = new InputManager('single');
+
+  clearWorld();
+  currentMap = getMap(info.mapId);
+  loadMap(world, currentMap);
+  zombieSpawnPoints =
+    currentMap.spawnGates.length > 0
+      ? currentMap.spawnGates.map((gate) => ({ x: gate.x, z: gate.y }))
+      : currentMap.zombieSpawns.map((s) => ({ x: s.x, z: s.y }));
+
+  isOnline = true;
+  localSeat = Math.max(0, info.players.findIndex((p) => p.sessionId === info.selfId));
+  const start = spawnForSeat(localSeat);
+  players.push(
+    createPlayer(world.scene, 0, CHARACTER_ORDER[localSeat % CHARACTER_ORDER.length], start)
+  );
+  syncRemotePlayers(info);
+
+  cameraRig = new CameraController(world, 'duo', centroidOf([...players, ...remotePlayers]));
+
+  hud.hidden = false;
+  card2.root.hidden = true;
+  mult2.hidden = true;
+  hideOverlay();
+  phase = 'playing';
+  toast(`ონლაინ მატჩი — ${currentMap.name}`, 3);
+}
+
+/** Renders lobby UI and keeps peer actors in sync with the live room state. */
+function handleRoomUpdate(info: RoomInfo | null): void {
+  onlineInfo = info;
+  setRoomInfo(info);
+  if (info && isOnline && phase === 'playing') syncRemotePlayers(info);
+}
+
+/** Builds the lobby client that drives the online panel and match start. */
+function createLobby(): Lobby {
+  return new Lobby({
+    onStatus: (state, message) => setOnlineStatus(state, message),
+    onRoom: (info) => handleRoomUpdate(info),
+    onStart: (info) => {
+      onlineInfo = info;
+      // Reconnect while a match is live: resync peers instead of restarting.
+      if (!isOnline || phase !== 'playing') startOnlineMatch(info);
+    },
+  });
 }
 
 function endGame(): void {
@@ -464,8 +628,25 @@ function backToMenu(): void {
 
 initMenu({
   onStart: (startMode, mapId) => startGame(startMode, mapId),
-  onRestart: () => startGame(lastMode, lastMapId),
+  onRestart: () => {
+    if (isOnline && onlineInfo) startOnlineMatch(onlineInfo);
+    else startGame(lastMode, lastMapId);
+  },
   onMenu: () => backToMenu(),
+  onCreateRoom: (name, mapId) => {
+    onlineLobby = createLobby();
+    void onlineLobby.createRoom(name, mapId);
+  },
+  onJoinRoom: (code, name) => {
+    onlineLobby = createLobby();
+    void onlineLobby.joinRoom(code, name);
+  },
+  onStartOnline: () => onlineLobby?.startMatch(),
+  onLeaveOnline: () => {
+    onlineLobby?.leave();
+    onlineLobby = null;
+    onlineInfo = null;
+  },
 });
 
 window.addEventListener('resize', () => resizeWorld(world));
@@ -1129,7 +1310,11 @@ function update(dt: number, nowMs: number): void {
     if (inp.shooting(player.index)) tryFire(player, nowMs);
   }
 
-  cameraRig.update(players, dt);
+  cameraPlayers.length = 0;
+  for (const player of players) cameraPlayers.push(player);
+  for (const remote of remotePlayers) cameraPlayers.push(remote);
+  cameraRig.update(cameraPlayers, dt);
+  if (isOnline) publishPresence();
 
   // waves — spawn relative to the first alive player
   const anchor = players.find((p) => p.alive) ?? players[0];
@@ -1301,6 +1486,14 @@ Object.defineProperty(globalThis, '__game_shoot', {
     },
     get mode(): GameMode {
       return mode;
+    },
+    /** True while the current match is an online room match. */
+    get online(): boolean {
+      return isOnline;
+    },
+    /** Number of network-driven peer actors currently rendered. */
+    get remotes(): number {
+      return remotePlayers.length;
     },
     get players(): Player[] {
       return players;

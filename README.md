@@ -3,9 +3,12 @@
 Boxhead-style online multiplayer top-down zombie shooter.
 Full design: [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-## Current status — Phase 1 (offline vertical slice)
+## Current status — Phase 1 offline slice + Phase 2 online lobby
 
-Playable single-player vs. waves; monorepo foundation + shared packages in place:
+Playable single-player/local co-op vs. waves, plus a working online lobby:
+create a room, share its 6-char code, join from another browser, and start a
+match together (see **Online lobby** below). Monorepo foundation + shared
+packages in place:
 
 ```
 shared/   wire codecs (Input/Snapshot/Event, pack/unpack tests), tick constants,
@@ -19,8 +22,10 @@ client/   Vite + Three.js angled-isometric game (keyboard-only, 8-way aim):
           src/game/projectiles.ts — arcing/bouncing grenades, rockets, fireballs
           src/game/fx.ts        — pooled tracers + muzzle flashes (no per-shot GC)
           src/game/enemies.ts   — boxhead zombies, flow-field steering, waves
-          src/main.ts           — input, loop, HUD, combat glue
-server/   dependency-free HTTP scaffold (Colyseus rooms arrive in Phase 2)
+          src/network/lobby.ts  — Colyseus client: create/join by code, presence, reconnect
+          src/main.ts           — input, loop, HUD, combat glue + online match wiring
+server/   Colyseus server: CoopRoom lobby (6-char room codes, seats, host,
+          presence relay, start) over the WebSocket transport, plus /healthz
 ```
 
 ## Requirements
@@ -36,15 +41,26 @@ npm install            # client deps: three, vite; root: typescript (needed for 
 npm test               # 8 shared test files via node:test — no install needed to run them
 npm run typecheck      # tsc --noEmit for shared + server + client
 
-npm run dev:server     # http://localhost:2567/healthz
+npm run dev:server     # Colyseus lobby on ws://localhost:2567 (http /healthz)
 npm run dev:client     # Vite dev server on :5173 — then press „დაწყება"
+```
+
+### Online lobby checks
+
+```bash
+# server-only: create → join-by-code → presence relay → host start
+node scripts/lobby-check.mjs           # needs dev:server
+
+# two real browser tabs over CDP: create room, join by code, start, both in play
+node scripts/lobby-browser-check.mjs   # needs dev:server + dev:client
+                                       #   + Chrome on --remote-debugging-port=9333
 ```
 
 ## Deployment (Render + Vercel)
 
-Two free services, both auto-deploying from the repo. The server is still the Phase 0
-scaffold, so today it only serves `/healthz`; the pipeline is in place for Phase 2's
-Colyseus rooms.
+Two free services, both auto-deploying from the repo. The server is a Colyseus
+websocket server: it answers the matchmaking routes for the `coop` room and still
+serves `/healthz` for Render's health check.
 
 | Piece | Host | Config | Build → run |
 |---|---|---|---|
@@ -100,7 +116,26 @@ weapons/combo tests check the config directly.
 
 Schemas: `shared/src/protocol/messages.ts`, layouts: `shared/src/protocol/codec.ts`.
 
+## Online lobby (Phase 2)
+
+The client (`src/network/lobby.ts`) builds a Colyseus `Client` from `VITE_SERVER_URL`
+and the server (`server/src/rooms/CoopRoom.ts`) hosts one room type, `coop`:
+
+- **Create** → `client.create('coop', { name, mapId })`. The server generates a
+  unique **6-char room code** and uses it as the Colyseus `roomId`.
+- **Join** → `client.joinById(code, { name })` with the shared code (wrong code
+  surfaces a friendly error in the lobby panel).
+- **Presence** → each client sends its transform ~20 Hz; the room relays it and
+  peers render each other. `patchRate` is 50 ms.
+- **Host** → first player in; only the host may `start`, which flips the room to
+  `playing` and every client launches the match in sync.
+- **Reconnect** → an unexpected drop holds the seat for 30 s and the client
+  reconnects with its reconnection token.
+
+> Scope: this is a **lobby + presence** layer. Enemy/combat simulation is still
+> per-client; server-authoritative movement and horde sync are Phase 3–5.
+
 ## Next
 
-- **Phase 2** — Colyseus lobby with room codes (ARCHITECTURE.md §2.6)
 - **Phase 3** — server-authoritative movement + prediction/reconciliation
+- **Phase 4–5** — server hitscan/combat and horde snapshot sync

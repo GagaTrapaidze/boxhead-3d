@@ -6,8 +6,8 @@
  * Render service URL, e.g. `wss://game-shoot-server.onrender.com`. Local dev
  * falls back to the Phase 0 scaffold.
  *
- * Phase 2 consumes this as `new Client(SERVER_URL)` from colyseus.js — the
- * online lobby currently only surfaces the resolved URL for verification.
+ * The online lobby (`src/network/lobby.ts`) builds its Colyseus `Client` from
+ * this URL; room create/join and presence relay live there.
  */
 const DEFAULT_SERVER_URL = 'ws://localhost:2567';
 

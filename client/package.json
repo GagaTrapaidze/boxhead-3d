@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "colyseus.js": "^0.16.22",
     "three": "^0.169.0"
   },
   "devDependencies": {
