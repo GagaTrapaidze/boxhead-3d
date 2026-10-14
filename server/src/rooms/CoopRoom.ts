@@ -1,14 +1,21 @@
 /**
  * CoopRoom — the authoritative lobby/game room for online co-op.
  *
- * This is the Phase 2 matchmaking room: it owns a human-readable 6-char room
- * code (the code *is* the Colyseus roomId, so clients join by code), tracks the
- * connected players, elects a host, relays lightweight presence (position/aim/
- * hp/weapon) and lets the host start the match.
+ * The room owns the whole shared world: a human-readable 6-char room code (the
+ * code *is* the Colyseus roomId, so clients join by code), the connected players
+ * (presence + life state), and — through {@link WorldSim} — every enemy's id,
+ * position, health and target, the wave director, barrels / crates, explosive
+ * chain reactions, the Devil's fireballs / hazards and dropped loot.
  *
- * Scope note: this room is a *lobby + presence* layer (see the two-player MVP).
- * Enemy/combat simulation stays client-side for now; server-authoritative
- * movement and horde sync arrive in Phase 3–5 (ARCHITECTURE.md §2.3–2.5).
+ * Clients are thin renderers for that world: they mirror `state.enemies`,
+ * `state.props` and `state.drops` into meshes, resolve their own shots against
+ * the mirrored positions and report the damage back (`damageEnemy`,
+ * `damageProp`, `explode`); the room applies it, kills/destroys, rolls drops and
+ * broadcasts one-shot events (`enemyKilled`, `propDestroyed`, `explosion`,
+ * `waveStart`, `waveClear`) so every client reacts at the same instant.
+ *
+ * Player HP stays client-authoritative: the room forwards melee / hazard /
+ * fireball / explosion damage to the affected client via `damagePlayer`.
  *
  * State is declared with the decorator-free `schema()` builder, so it runs
  * under Node's type-stripping dev server (`node --experimental-strip-types`)
@@ -24,9 +31,14 @@ import {
   RECONNECT_GRACE_MS,
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
+  SNAPSHOT_RATE,
+  TICK_MS,
 } from '../../../shared/src/constants.ts';
 import { COOP_CONFIG } from '../../../shared/src/balance.config.ts';
 import { DEFAULT_MAP_ID, getMap } from '../../../shared/src/maps.ts';
+import { dropKindCode, enemyKindCode, propKindCode } from '../../../shared/src/loot.ts';
+import type { PropKind } from '../../../shared/src/loot.ts';
+import { WorldSim } from './world.ts';
 
 /** One player's synchronized presence inside the room. */
 export const PlayerPresence = schema(
@@ -51,6 +63,71 @@ export const PlayerPresence = schema(
 );
 export type PlayerPresence = SchemaType<typeof PlayerPresence>;
 
+/** One authoritative mob in the shared world. */
+export const EnemyState = schema(
+  {
+    /** `EnemyKind` wire code (see shared/src/loot.ts). */
+    kind: 'uint8',
+    /** Stable server-assigned id (the map key is its decimal string). */
+    id: 'uint16',
+    x: 'float32',
+    z: 'float32',
+    /** Facing angle in radians — clients copy this onto the mesh rotation. */
+    dir: 'float32',
+    hp: 'uint16',
+    maxHp: 'uint16',
+    /** Devil only: phase-2 rage (burning / dashing) is active. */
+    phase2: 'boolean',
+    /** sessionId of the player this mob is currently chasing ("" = none). */
+    target: 'string',
+  },
+  'EnemyState'
+);
+export type EnemyState = SchemaType<typeof EnemyState>;
+
+/** One authoritative deployable (explosive barrel or wooden crate). */
+export const PropState = schema(
+  {
+    /** `PropKind` wire code (see shared/src/loot.ts). */
+    kind: 'uint8',
+    cx: 'uint16',
+    cz: 'uint16',
+    hp: 'uint16',
+    maxHp: 'uint16',
+  },
+  'PropState'
+);
+export type PropState = SchemaType<typeof PropState>;
+
+/** One authoritative ground drop (map key = its decimal drop id). */
+export const DropState = schema(
+  {
+    /** `DropKind` wire code (see shared/src/loot.ts). */
+    kind: 'uint8',
+    id: 'uint16',
+    x: 'float32',
+    z: 'float32',
+    /** Seconds until the server despawns it (clients blink near the end). */
+    ttl: 'float32',
+  },
+  'DropState'
+);
+export type DropState = SchemaType<typeof DropState>;
+
+/** One fiery floor patch left behind by a phase-2 Devil dash. */
+export const HazardState = schema(
+  { x: 'float32', z: 'float32', radius: 'float32', life: 'float32', maxLife: 'float32' },
+  'HazardState'
+);
+export type HazardState = SchemaType<typeof HazardState>;
+
+/** One authoritative Devil fireball in flight. */
+export const FireballState = schema(
+  { x: 'float32', z: 'float32', dirX: 'float32', dirZ: 'float32' },
+  'FireballState'
+);
+export type FireballState = SchemaType<typeof FireballState>;
+
 /** The room's synchronized state (patched to clients at `patchRate`). */
 export const CoopRoomState = schema(
   {
@@ -63,7 +140,17 @@ export const CoopRoomState = schema(
     phase: 'string',
     /** true once every player is down at once — Game Over for the whole room. */
     matchOver: 'boolean',
+    /** Wave director: current wave, its themed event and phase/timer. */
+    wave: 'uint16',
+    event: 'string',
+    directorPhase: 'string',
+    directorTimer: 'float32',
     players: { map: PlayerPresence },
+    enemies: { map: EnemyState },
+    props: { map: PropState },
+    drops: { map: DropState },
+    hazards: { map: HazardState },
+    fireballs: { map: FireballState },
   },
   'CoopRoomState'
 );
@@ -83,6 +170,12 @@ export interface CoopJoinOptions {
 const activeCodes = new Set<string>();
 
 const NAME_MAX_LENGTH = 14;
+/** Milliseconds per state patch — the shared 20 Hz snapshot cadence. */
+const PATCH_INTERVAL_MS = 1000 / SNAPSHOT_RATE;
+/** A single reported hit may never exceed this (guards a rogue/malicious client). */
+const MAX_HIT_DAMAGE = 1000;
+/** Largest blast radius a client may report (rocket/barell blasts are ≤ 5). */
+const MAX_EXPLOSION_RADIUS = 12;
 
 function randomRoomCode(): string {
   let code = '';
@@ -113,11 +206,21 @@ function clamp(value: unknown, min: number, max: number, fallback: number): numb
   return Math.min(max, Math.max(min, n));
 }
 
+/** Reads a grid coordinate from a message, or null when it is not an integer. */
+function readCell(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isInteger(value)) return null;
+  if (value < 0 || value > 255) return null;
+  return value;
+}
+
 export class CoopRoom extends Room {
   override maxClients = MAX_PLAYERS;
-  /** 20 Hz presence updates — matches the snapshot cadence in shared constants. */
-  override patchRate = 50;
+  /** 20 Hz world snapshots (shared/src/constants.ts SNAPSHOT_RATE). */
+  override patchRate = PATCH_INTERVAL_MS;
   override state = new CoopRoomState();
+
+  /** Authoritative world simulation (enemies / props / drops / hazards). */
+  private sim: WorldSim = new WorldSim(DEFAULT_MAP_ID);
 
   override onCreate(options: CoopJoinOptions = {}): void {
     this.roomId = allocateRoomCode();
@@ -128,6 +231,12 @@ export class CoopRoom extends Room {
     this.state.phase = 'lobby';
     this.state.matchOver = false;
     this.state.mapId = getMap(options.mapId ?? DEFAULT_MAP_ID).id;
+    this.state.wave = 0;
+    this.state.event = 'none';
+    this.state.directorPhase = 'intermission';
+    this.state.directorTimer = 0;
+
+    this.sim = new WorldSim(this.state.mapId);
 
     // Metadata lets future matchmaking queries (and dashboards) find the room
     // by code/phase without receiving the full state.
@@ -169,13 +278,79 @@ export class CoopRoom extends Room {
       player.alive = false;
       player.hp = 0;
       player.respawnTimer = COOP_CONFIG.reviveCountdown;
-      // Schema fields (alive/respawnTimer/matchOver) carry all of this to peers.
       this.checkGameOver();
     });
 
-    // Responsive respawn clock — ticks the 10 s countdown independently of the
-    // 50 ms state patch rate, so a timer crossing zero flips `alive` promptly.
-    this.setSimulationInterval((deltaMs: number) => this.tickRespawns(deltaMs), 100);
+    // --- combat: a client resolves its own shot, the room applies the damage --
+    this.onMessage('damageEnemy', (client: Client, msg: { id?: number; damage?: number; weaponId?: number }) => {
+      if (!this.isLive()) return;
+      const id = readCell(msg?.id);
+      if (id === null) return;
+      const damage = clamp(msg?.damage, 0, MAX_HIT_DAMAGE, 0);
+      const weaponId = clamp(msg?.weaponId, 0, 255, 0);
+      this.sim.damageEnemy(id, damage, weaponId, client.sessionId);
+    });
+
+    // --- props: shot damage, and player placement -----------------------------
+    this.onMessage('damageProp', (client: Client, msg: { cx?: number; cz?: number; damage?: number }) => {
+      if (!this.isLive()) return;
+      const cx = readCell(msg?.cx);
+      const cz = readCell(msg?.cz);
+      if (cx === null || cz === null) return;
+      this.sim.damageProp(cx, cz, clamp(msg?.damage, 0, MAX_HIT_DAMAGE, 0), client.sessionId);
+    });
+
+    this.onMessage('placeProp', (client: Client, msg: { kind?: number; cx?: number; cz?: number }) => {
+      if (!this.isLive()) return;
+      const cx = readCell(msg?.cx);
+      const cz = readCell(msg?.cz);
+      if (cx === null || cz === null) return;
+      const kind: PropKind = msg?.kind === propKindCode('crate') ? 'crate' : 'barrel';
+      this.sim.placeProp(kind, cx, cz); // the state patch confirms it for everyone
+    });
+
+    // --- confirmation: the room owns the blast (damage, chains, kills) --------
+    this.onMessage(
+      'explode',
+      (client: Client, msg: { x?: number; z?: number; radius?: number; damage?: number; playerDamage?: number }) => {
+        if (!this.isLive()) return;
+        const x = clamp(msg?.x, -512, 512, 0);
+        const z = clamp(msg?.z, -512, 512, 0);
+        const radius = clamp(msg?.radius, 0, MAX_EXPLOSION_RADIUS, 0);
+        const damage = clamp(msg?.damage, 0, MAX_HIT_DAMAGE, 0);
+        // The client's sentinel: a negative value (it sends -1) or an absent
+        // field means the blast scales its player damage with distance —
+        // barrels and rockets, exactly as offline. A positive value is flat
+        // blast damage (grenade/mine), and 0 means the blast spares players.
+        const reportedPlayerDamage = msg?.playerDamage;
+        const playerDamage =
+          typeof reportedPlayerDamage === 'number' && reportedPlayerDamage >= 0
+            ? clamp(reportedPlayerDamage, 0, MAX_HIT_DAMAGE, 0)
+            : undefined;
+        this.sim.explode(x, z, radius, damage, playerDamage, true, client.sessionId);
+      }
+    );
+
+    // --- loot: walk-over pickup, granted by the server ------------------------
+    this.onMessage('pickupItem', (client: Client, msg: { id?: number; x?: number; z?: number }) => {
+      if (!this.isLive()) return;
+      const player = this.state.players.get(client.sessionId);
+      if (!player || !player.alive) return;
+      const id = readCell(msg?.id);
+      if (id === null) return;
+      // Trust the *server's* copy of the player position, not the message's.
+      const kind = this.sim.pickup(id, player.x, player.z);
+      if (kind) client.send('granted', { kind: dropKindCode(kind) });
+    });
+
+    // Fixed-rate clock (shared TICK_RATE, 30 Hz): advances the world and the
+    // respawn countdowns; the schema is patched at the 20 Hz snapshot rate.
+    this.setSimulationInterval((deltaMs: number) => this.tick(deltaMs), TICK_MS);
+  }
+
+  /** True while a live match is running (not lobby, not game over). */
+  private isLive(): boolean {
+    return this.state.phase === 'playing' && !this.state.matchOver;
   }
 
   /** Resets the room to a fresh, fully-alive match (initial start and restart). */
@@ -187,7 +362,181 @@ export class CoopRoom extends Room {
       player.hp = PLAYER_MAX_HP;
       player.respawnTimer = 0;
     });
+    // A fresh (or re-rolled) world: clears mobs, props, drops and the director.
+    this.sim.reset(this.state.mapId);
+    this.syncWorld();
     this.setMetadata({ code: this.state.code, mapId: this.state.mapId, phase: 'playing' });
+  }
+
+  /**
+   * One simulation tick: advance the world, flush damage to the affected
+   * clients, broadcast the one-shot events, then mirror the world into the
+   * schema (patched to everyone at `patchRate`).
+   */
+  private tick(deltaMs: number): void {
+    const dt = deltaMs / 1000;
+
+    if (this.state.phase === 'playing') {
+      this.tickRespawns(dt);
+      if (!this.state.matchOver) {
+        this.sim.syncPlayers(this.simPlayers());
+        this.sim.step(dt);
+        this.flushPlayerDamage();
+        this.flushEvents();
+      }
+      this.syncWorld();
+    }
+  }
+
+  /** Live snapshot of the players the simulation chases. */
+  private simPlayers(): { id: string; x: number; z: number; alive: boolean }[] {
+    const list: { id: string; x: number; z: number; alive: boolean }[] = [];
+    this.state.players.forEach((player, sessionId) => {
+      list.push({ id: sessionId, x: player.x, z: player.z, alive: player.alive });
+    });
+    return list;
+  }
+
+  /** Routes accumulated melee / hazard / fireball / blast damage to its owner. */
+  private flushPlayerDamage(): void {
+    const damage = this.sim.drainPlayerDamage();
+    if (damage.size === 0) return;
+    damage.forEach((amount, sessionId) => {
+      const client = this.clients.getById(sessionId);
+      if (client) client.send('damagePlayer', { amount });
+    });
+  }
+
+  /** Broadcasts one-shot world events so every client reacts at the same time. */
+  private flushEvents(): void {
+    for (const event of this.sim.drainEvents()) {
+      if (event.type === 'enemyKilled') {
+        this.broadcast('enemyKilled', {
+          id: event.id,
+          kind: enemyKindCode(event.kind),
+          x: event.x,
+          z: event.z,
+          killer: event.killer,
+        });
+      } else if (event.type === 'propDestroyed') {
+        this.broadcast('propDestroyed', {
+          kind: propKindCode(event.kind),
+          cx: event.cx,
+          cz: event.cz,
+        });
+      } else if (event.type === 'explosion') {
+        this.broadcast('explosion', { x: event.x, z: event.z, radius: event.radius });
+      } else if (event.type === 'waveStart') {
+        this.broadcast('waveStart', { wave: event.wave, event: event.event });
+      } else {
+        this.broadcast('waveClear', { wave: event.wave });
+      }
+    }
+  }
+
+  /**
+   * Mirrors the simulation into the schema. Entities are diffed against the
+   * existing maps so a steady wave does not thrash the patch stream.
+   */
+  private syncWorld(): void {
+    this.state.wave = this.sim.wave;
+    this.state.event = this.sim.event;
+    this.state.directorPhase = this.sim.phase;
+    this.state.directorTimer = Math.max(0, this.sim.timer);
+
+    // enemies
+    const enemyKeys = new Set<string>();
+    for (const enemy of this.sim.enemies) {
+      const key = String(enemy.id);
+      enemyKeys.add(key);
+      let entry = this.state.enemies.get(key);
+      if (!entry) {
+        entry = new EnemyState();
+        entry.id = enemy.id;
+        this.state.enemies.set(key, entry);
+      }
+      entry.kind = enemyKindCode(enemy.kind);
+      entry.x = enemy.x;
+      entry.z = enemy.z;
+      entry.dir = enemy.dir;
+      entry.hp = Math.max(0, Math.round(enemy.hp));
+      entry.maxHp = enemy.maxHp;
+      entry.phase2 = enemy.phase2;
+      entry.target = enemy.target;
+    }
+    this.pruneMap(this.state.enemies, enemyKeys);
+
+    // props
+    const propKeys = new Set<string>();
+    for (const prop of this.sim.props) {
+      const key = `${prop.cx},${prop.cz}`;
+      propKeys.add(key);
+      let entry = this.state.props.get(key);
+      if (!entry) {
+        entry = new PropState();
+        this.state.props.set(key, entry);
+      }
+      entry.kind = propKindCode(prop.kind);
+      entry.cx = prop.cx;
+      entry.cz = prop.cz;
+      entry.hp = Math.max(0, Math.round(prop.hp));
+      entry.maxHp = prop.maxHp;
+    }
+    this.pruneMap(this.state.props, propKeys);
+
+    // drops
+    const dropKeys = new Set<string>();
+    for (const drop of this.sim.drops) {
+      const key = String(drop.id);
+      dropKeys.add(key);
+      let entry = this.state.drops.get(key);
+      if (!entry) {
+        entry = new DropState();
+        entry.id = drop.id;
+        this.state.drops.set(key, entry);
+      }
+      entry.kind = dropKindCode(drop.kind);
+      entry.x = drop.x;
+      entry.z = drop.z;
+      entry.ttl = Math.max(0, drop.ttl);
+    }
+    this.pruneMap(this.state.drops, dropKeys);
+
+    // hazards
+    const hazardIds = this.sim.hazards.map((hazard) => String(hazard.id));
+    this.state.hazards.clear();
+    for (let i = 0; i < this.sim.hazards.length; i++) {
+      const hazard = this.sim.hazards[i];
+      const entry = new HazardState();
+      entry.x = hazard.x;
+      entry.z = hazard.z;
+      entry.radius = hazard.radius;
+      entry.life = Math.max(0, hazard.life);
+      entry.maxLife = hazard.maxLife;
+      this.state.hazards.set(hazardIds[i], entry);
+    }
+
+    // fireballs
+    const fireballIds = this.sim.fireballs.map((ball) => String(ball.id));
+    this.state.fireballs.clear();
+    for (let i = 0; i < this.sim.fireballs.length; i++) {
+      const ball = this.sim.fireballs[i];
+      const entry = new FireballState();
+      entry.x = ball.x;
+      entry.z = ball.z;
+      entry.dirX = ball.dirX;
+      entry.dirZ = ball.dirZ;
+      this.state.fireballs.set(fireballIds[i], entry);
+    }
+  }
+
+  /** Deletes every map entry whose key is not in `keep`. */
+  private pruneMap(map: { forEach: (fn: (value: unknown, key: string) => void) => void; delete: (key: string) => boolean }, keep: Set<string>): void {
+    const stale: string[] = [];
+    map.forEach((_value, key) => {
+      if (!keep.has(key)) stale.push(key);
+    });
+    for (const key of stale) map.delete(key);
   }
 
   /**
@@ -196,9 +545,8 @@ export class CoopRoom extends Room {
    * teammate is alive the room is already over (see {@link checkGameOver}), so
    * respawns simply never fire in that state.
    */
-  private tickRespawns(deltaMs: number): void {
-    if (this.state.phase !== 'playing' || this.state.matchOver) return;
-    const dt = deltaMs / 1000;
+  private tickRespawns(dt: number): void {
+    if (this.state.matchOver) return;
     this.state.players.forEach((player) => {
       if (player.alive) return;
       player.respawnTimer = Math.max(0, player.respawnTimer - dt);
@@ -236,9 +584,7 @@ export class CoopRoom extends Room {
     this.state.players.forEach((player) => {
       if (player.alive) anyAlive = true;
     });
-    if (!anyAlive) {
-      this.state.matchOver = true;
-    }
+    if (!anyAlive) this.state.matchOver = true;
   }
 
   /** A seat's safe spawn point from the active map's authored spawn list. */

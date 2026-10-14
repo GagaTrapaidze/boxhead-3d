@@ -3,12 +3,13 @@
 Boxhead-style online multiplayer top-down zombie shooter.
 Full design: [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-## Current status — Phase 1 offline slice + Phase 2 online lobby
+## Current status — offline slice + online lobby + authoritative shared world
 
-Playable single-player/local co-op vs. waves, plus a working online lobby:
-create a room, share its 6-char code, join from another browser, and start a
-match together (see **Online lobby** below). Monorepo foundation + shared
-packages in place:
+Playable single-player/local co-op vs. waves, plus a working online mode where
+the Colyseus room owns the whole **shared world**: mobs, barrels/crates, loot,
+wave director, the Devil's fireballs/hazards and explosive chains. Clients render
+that world from the room state and report the shots they resolve (see
+**Authoritative world** below). Monorepo foundation + shared packages in place:
 
 ```
 shared/   wire codecs (Input/Snapshot/Event, pack/unpack tests), tick constants,
@@ -16,16 +17,19 @@ shared/   wire codecs (Input/Snapshot/Event, pack/unpack tests), tick constants,
           balance.config.ts — ALL gameplay tuning (weapon stats, cadence, drops, waves)
           weapons.ts     — weapon table (pistol…railgun) + RoF/ammo/tier helpers
           flowfield.ts   — Dijkstra flow field for the horde (no per-zombie A*)
+          loot.ts        — wire-stable enemy/prop/drop kinds + the loot rolls both sides share
 client/   Vite + Three.js angled-isometric game (keyboard-only, 8-way aim):
           src/game/world.ts     — ortho camera + lit 3D arena built onto the GridMap
           src/game/player.ts    — movement, 8-way facing, recoil, hitscan resolution
           src/game/projectiles.ts — arcing/bouncing grenades, rockets, fireballs
           src/game/fx.ts        — pooled tracers + muzzle flashes (no per-shot GC)
-          src/game/enemies.ts   — boxhead zombies, flow-field steering, waves
-          src/network/lobby.ts  — Colyseus client: create/join by code, presence, reconnect
+          src/game/enemies.ts   — boxhead zombies, flow-field steering, waves (offline)
+          src/network/lobby.ts  — Colyseus client: create/join, presence, world state, events
+          src/network/onlineWorld.ts — mirror: renders state.enemies/props/drops/hazards
           src/main.ts           — input, loop, HUD, combat glue + online match wiring
-server/   Colyseus server: CoopRoom lobby (6-char room codes, seats, host,
-          presence relay, start) over the WebSocket transport, plus /healthz
+server/   Colyseus server: CoopRoom (6-char room codes, seats, host, presence,
+          world authority) + rooms/world.ts (the mesh-free horde/props/drops sim),
+          over the WebSocket transport, plus /healthz
 ```
 
 ## Requirements
@@ -38,23 +42,31 @@ server/   Colyseus server: CoopRoom lobby (6-char room codes, seats, host,
 ```bash
 npm install            # client deps: three, vite; root: typescript (needed for dev/typecheck)
 
-npm test               # 8 shared test files via node:test — no install needed to run them
+npm test               # 13 shared test files via node:test — no install needed to run them
 npm run typecheck      # tsc --noEmit for shared + server + client
 
 npm run dev:server     # Colyseus lobby on ws://localhost:2567 (http /healthz)
 npm run dev:client     # Vite dev server on :5173 — then press „დაწყება"
 ```
 
-### Online lobby checks
+### Online checks
 
 ```bash
 # server-only: create → join → downed → 10 s respawn → Game Over → restart
 node scripts/lobby-check.mjs           # needs dev:server
 
+# server-only, world authority: server-authored mobs, prop placement/destruction,
+# kill broadcast + loot roll, server-validated walk-over pickup
+LOBBY_URL=ws://localhost:2567 node scripts/online-world-check.mjs   # needs dev:server
+
 # two real browser tabs over CDP: create room, join by code, start, downed
 # countdown, respawn, and Game Over reaching both clients
 node scripts/lobby-browser-check.mjs   # needs dev:server + dev:client
                                        #   + Chrome on --remote-debugging-port=9333
+
+# two real browser tabs: both render the identical server world (same mob ids,
+# replicated props, a kill vanishing from both, loot mirrored)
+node scripts/online-world-browser-check.mjs   # same requirements as above
 
 # local 2-player downed → passive revive → Game Over (guards the local rules)
 node scripts/local-revive-check.mjs    # needs dev:client + Chrome on :9333
@@ -143,10 +155,46 @@ and the server (`server/src/rooms/CoopRoom.ts`) hosts one room type, `coop`:
 - **Reconnect** → an unexpected drop holds the seat for 30 s and the client
   reconnects with its reconnection token.
 
-> Scope: this is a **lobby + presence** layer. Enemy/combat simulation is still
-> per-client; server-authoritative movement and horde sync are Phase 3–5.
+## Authoritative world (Phase 3–5)
+
+In an online match the room owns the shared world and each client is a renderer:
+
+| Entity | Server (source of truth) | Client (mirror) |
+|---|---|---|
+| Mobs | `state.enemies` — server id, kind, `x`/`z`, `dir`, `hp`/`maxHp`, `phase2`, `target` | `onlineWorld.ts` spawns/removes/lerps a mesh per id |
+| Props | `state.props` — kind, cell, `hp`/`maxHp` | renders each cell as a barrel/crate |
+| Drops | `state.drops` — kind, position, despawn `ttl` | renders each drop cube + blink |
+| Hazards / fireballs | `state.hazards`, `state.fireballs` | rendered patches / flames |
+| Director | `wave`, `event`, `directorPhase`, `directorTimer` | HUD banners + timers |
+
+**Request → confirm.** The client resolves its own shots and reports them; the
+room applies the damage, kills/destroys, rolls loot and broadcasts the result:
+
+| Client → server | Server → all clients |
+|---|---|
+| `damageEnemy {id, damage, weaponId}` | `enemyKilled {id, kind, x, z, killer}` |
+| `damageProp {cx, cz, damage}` | `propDestroyed {kind, cx, cz}` |
+| `placeProp {kind, cx, cz}` | `explosion {x, z, radius}` |
+| `explode {x, z, radius, damage, playerDamage}` | `damagePlayer {amount}` (to one client) |
+| `pickupItem {id, x, z}` | `granted {kind}` (to one client) |
+| `presence {x, z, aimX, aimZ, hp, weapon}` | `waveStart` / `waveClear` |
+
+- **Player HP stays client-authoritative**: the room forwards melee, hazard,
+  fireball and blast damage (`damagePlayer`) to the owner's normal `applyDamage`,
+  so the existing downed/respawn/Game-Over rules keep working unchanged.
+- **Explosive chains** are server-side: a barrel that detonates queues its
+  neighbours on a staggered fuse (`chainFuseDelay`), and every client plays the
+  same blasts in the same order.
+- **Offline modes are untouched** — every online branch is behind `isOnline`, and
+  local single-player/co-op still simulate the horde in the browser.
+- Simulation runs at the shared `TICK_RATE` (30 Hz) with `SNAPSHOT_RATE`-paced
+  (20 Hz) state patches; mob meshes interpolate between patches.
+
+> Scope note: player projectiles (grenades/rockets/mines) still fly on the
+> owner's client, which reports the resulting blast to the room instead of
+> applying it locally.
 
 ## Next
 
-- **Phase 3** — server-authoritative movement + prediction/reconciliation
-- **Phase 4–5** — server hitscan/combat and horde snapshot sync
+- **Phase 6** — server-authoritative movement with client prediction/reconciliation
+- Move player projectiles into the room so peers see each other's grenades in flight

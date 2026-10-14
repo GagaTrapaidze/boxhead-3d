@@ -85,7 +85,7 @@ import { NightMode } from './game/lighting.ts';
 import { ReviveCircle } from './game/reviveCircle.ts';
 import { explode, spawnPlayerProjectile, updateProjectiles } from './game/projectiles.ts';
 import type { ExplosionEvent, Flash, Projectile, ProjectileWorld } from './game/projectiles.ts';
-import { rollDropKind, spawnPickup, updatePickups } from './game/pickups.ts';
+import { applyPickup, rollDropKind, spawnPickup, updatePickups } from './game/pickups.ts';
 import type { Pickup } from './game/pickups.ts';
 import type { PickupKind } from './game/actors.ts';
 import { FxLayer } from './game/fx.ts';
@@ -102,6 +102,8 @@ import {
 import type { MatchSummary, PlayerSummary, StartMode } from './ui/menu.ts';
 import { Lobby } from './network/lobby.ts';
 import type { OnlinePlayer, RoomInfo } from './network/lobby.ts';
+import { OnlineWorld } from './network/onlineWorld.ts';
+import type { OnlineWorldContext } from './network/onlineWorld.ts';
 import { weaponIconSvg } from './ui/weaponIcons.ts';
 
 type Phase = 'menu' | 'playing' | 'over';
@@ -208,6 +210,27 @@ let remoteBySession = new Map<string, Player>();
 const cameraPlayers: Player[] = [];
 let onlineLobby: Lobby | null = null;
 let onlineInfo: RoomInfo | null = null;
+
+/**
+ * Mirror of the server-authoritative world (mobs, props, drops, hazards). In an
+ * online match the local `horde`/`barricades`/`pickups` arrays are *renders* of
+ * this mirror — the server owns what exists, where it is and when it dies.
+ */
+const onlineWorld = new OnlineWorld();
+
+/** Live view of the render arrays the mirror writes into. */
+function onlineContext(): OnlineWorldContext {
+  return { scene: world.scene, grid: world.grid, horde, barricades, pickups };
+}
+
+/**
+ * Blasts we already resolved and reported this frame: the server echoes them
+ * back (`explosion`), and the local flash has already played, so the echo must
+ * not double it up.
+ */
+const pendingLocalExplosions: { x: number; z: number }[] = [];
+/** A single client-resolved hit on a barrel always detonates it (as locally). */
+const BARREL_SHOT_DAMAGE = 1000;
 
 let toastText = '';
 let toastTimer = 0;
@@ -353,6 +376,9 @@ function removeMeshes(list: { mesh: THREE.Object3D }[]): void {
 }
 
 function clearWorld(): void {
+  // Drop the mirrored world first: it removes its own proxies from the live
+  // arrays, so nothing is left dangling across a match restart.
+  onlineWorld.reset(onlineContext());
   removeMeshes(horde.zombies);
   horde.field = null;
   horde.fieldTimer = 0;
@@ -699,6 +725,26 @@ function handleRoomUpdate(info: RoomInfo | null): void {
   }
   syncRemotePlayers(info);
   syncLocalPlayer(info);
+
+  // Mirror the server's wave director into the local HUD state, then reconcile
+  // every authoritative entity into its render proxy.
+  director.wave = info.wave;
+  director.event = info.event;
+  director.phase = info.directorPhase;
+  director.timer = info.directorTimer;
+  onlineWorld.sync(onlineContext(), info);
+
+  // A prop the server just confirmed may share the local player's cell (crates
+  // are deployed underfoot) — push them out before the next shot resolves.
+  const local = players[0];
+  if (local && local.alive) {
+    const resolved = world.grid.resolveCircle(local.x, local.z, PLAYER_RADIUS);
+    if (resolved.x !== local.x || resolved.z !== local.z) {
+      local.x = resolved.x;
+      local.z = resolved.z;
+      syncActor(local);
+    }
+  }
 }
 
 /** Builds the lobby client that drives the online panel and match start. */
@@ -711,7 +757,129 @@ function createLobby(): Lobby {
       // Reconnect while a match is live: resync peers instead of restarting.
       if (!isOnline || phase !== 'playing') startOnlineMatch(info);
     },
+    onEnemyKilled: (event) => handleEnemyKilled(event),
+    onPropDestroyed: (event) => {
+      // A destroyed crate splinters where it stood; a barrel's blast is its own
+      // `explosion` event, so it is not doubled up here.
+      if (event.kind === 'crate') {
+        audio.zombieHit();
+        gibs.burst(event.cx + 0.5, event.cz + 0.5, 3);
+      }
+    },
+    onExplosion: (event) => handleServerExplosion(event.x, event.z, event.radius),
+    onDamagePlayer: (amount) => {
+      const local = players[0];
+      if (local) applyDamage(local, amount);
+    },
+    onGranted: (kind) => {
+      const local = players[0];
+      if (!local) return;
+      audio.pickup();
+      const message = applyPickup(local, kind);
+      if (local.weapon !== local._lastWeaponId) {
+        updateWeaponMesh(local.mesh, local.weapon);
+        local._lastWeaponId = local.weapon;
+      }
+      toast(`${local.character}: ${message}`, 2);
+    },
+    onWaveStart: (wave, event) => handleRemoteWaveStart(wave, event),
+    onWaveClear: (wave) => handleRemoteWaveClear(wave),
   });
+}
+
+/**
+ * A mob died — the server decided it, so the FX play for everyone while only the
+ * client whose shot landed the kill credits score and combo.
+ */
+function handleEnemyKilled(event: {
+  kind: keyof typeof ENEMY_CONFIG & string;
+  x: number;
+  z: number;
+  killer: string;
+}): void {
+  const stats = ENEMY_CONFIG[event.kind as 'walker' | 'runner' | 'devil'];
+  const owner = event.killer !== '' && event.killer === onlineInfo?.selfId ? players[0] ?? null : null;
+  score += stats.score * (owner ? owner.mult : 1);
+  if (owner) {
+    owner.kills += 1;
+    registerKill(owner);
+    if (isComboMilestone(owner.mult)) {
+      grantSpree(owner);
+      const label = comboMilestoneLabel(owner.mult);
+      if (label) showComboBanner(label);
+      audio.spree();
+    }
+  }
+  audio.zombieDeath();
+  const gibCount =
+    event.kind === 'devil'
+      ? JUICE_CONFIG.gibCountBoss
+      : JUICE_CONFIG.gibCountMin +
+        Math.floor(Math.random() * (JUICE_CONFIG.gibCountMax - JUICE_CONFIG.gibCountMin + 1));
+  gibs.burst(event.x, event.z, gibCount);
+}
+
+/** Plays the blast flash for a server-confirmed explosion (ours are skipped). */
+function handleServerExplosion(x: number, z: number, radius: number): void {
+  const index = pendingLocalExplosions.findIndex(
+    (pending) => Math.abs(pending.x - x) < 0.01 && Math.abs(pending.z - z) < 0.01
+  );
+  if (index !== -1) {
+    pendingLocalExplosions.splice(index, 1); // our own blast: the flash is live
+    return;
+  }
+  // `explode` also draws the expanding flash; the damage it computes here is
+  // discarded (the server already applied the real blast).
+  explode(
+    world.scene,
+    flashes,
+    { ownerIndex: -1, x, z, radius, damage: 0 },
+    currentProjectileWorld()
+  );
+  cameraRig?.addTrauma(JUICE_CONFIG.barrelChainTrauma);
+}
+
+/** Reports a blast this client resolved; the room owns its damage and chains. */
+function reportLocalExplosion(explosion: ExplosionEvent): void {
+  onlineLobby?.reportExplosion(
+    explosion.x,
+    explosion.z,
+    explosion.radius,
+    explosion.damage,
+    explosion.flatPlayerDamage !== undefined ? explosion.flatPlayerDamage : -1
+  );
+  // Remember it so the server's echo doesn't replay the same flash.
+  pendingLocalExplosions.push({ x: explosion.x, z: explosion.z });
+  if (pendingLocalExplosions.length > 32) pendingLocalExplosions.shift();
+}
+
+/** Themed wave banner/toast for a server-declared wave (both clients agree). */
+function handleRemoteWaveStart(wave: number, event: WaveEventKind): void {
+  const label = waveEventLabel(event);
+  if (label) {
+    showEventBanner(label);
+    audio.spree();
+    toast(
+      event === 'speedHorde'
+        ? `ტალღა ${wave} — SPEED HORDE · RUNNERS ×1.8!`
+        : `ტალღა ${wave} — BLACKOUT! · გამოიყენე ფარა!`,
+      3
+    );
+    return;
+  }
+  toast(`ტალღა ${wave}!`, 2);
+}
+
+/** Wave cleared: living players return to full HP with topped-up magazines. */
+function handleRemoteWaveClear(wave: number): void {
+  for (const player of players) {
+    if (WAVE_CONFIG.fullHpRestoreOnWaveEnd) healToFull(player);
+    for (const [weaponId, ammo] of player.ammo) {
+      const mag = getWeapon(weaponId).magSize;
+      if (mag > 0 && ammo < mag) player.ammo.set(weaponId, mag);
+    }
+  }
+  toast(`ტალღა ${wave} გადალახული! · +100% HP RESTORED`, 3.5);
 }
 
 function endGame(): void {
@@ -932,6 +1100,11 @@ function tryFire(player: Player, nowMs: number): void {
     if (barrel) {
       const barrelDistance = Math.hypot(barrel.cx + 0.5 - player.x, barrel.cz + 0.5 - player.z);
       if (!embeddedAny && barrelDistance <= nearestZombieDistance) {
+        // Online: the room detonates it (its blast, chain and kills are shared).
+        if (isOnline) {
+          onlineLobby?.reportPropDamage(barrel.cx, barrel.cz, BARREL_SHOT_DAMAGE);
+          return;
+        }
         detonateBarrel(barrel, player);
         return;
       }
@@ -952,6 +1125,11 @@ function tryFire(player: Player, nowMs: number): void {
       if (!embeddedAny && crateDistance <= nearestZombieDistance) {
         audio.zombieHit();
         fx.impact(crate.cx + 0.5, crate.cz + 0.5, CRATE_CONFIG.tracerColor, 0.8);
+        if (isOnline) {
+          // The room applies the hit and splinters the crate for everyone.
+          onlineLobby?.reportPropDamage(crate.cx, crate.cz, def.damage * power);
+          return;
+        }
         if (damageBarricade(world.grid, world.scene, barricades, crate, def.damage * power)) {
           gibs.burst(crate.cx + 0.5, crate.cz + 0.5, 3); // splintered
         }
@@ -984,6 +1162,15 @@ function tryFire(player: Player, nowMs: number): void {
     }
 
     if (victims.size > 0) player.shotsHit += 1; // any connecting pellet = a hit
+    if (isOnline) {
+      // The room owns mob health: report each victim's damage; the death, the
+      // loot roll and the kill credit come back as shared events.
+      victims.forEach((damage, zombie) => {
+        const id = onlineWorld.enemyIdOf(zombie);
+        if (id !== undefined) onlineLobby?.reportEnemyHit(id, damage, weaponId);
+      });
+      return;
+    }
     victims.forEach((damage, zombie) => damageZombie(zombie, damage, player, def));
     return;
   }
@@ -1010,6 +1197,13 @@ function tryFire(player: Player, nowMs: number): void {
 
   if ((weaponId === WeaponId.Barrel || weaponId === WeaponId.Crate) && targetCell) {
     const kind: BarricadeKind = weaponId === WeaponId.Crate ? 'crate' : 'barrel';
+    if (isOnline) {
+      // Server-validated placement: the prop appears for everyone from the state
+      // patch (and blocks the cell here only once it is confirmed).
+      onlineLobby?.requestPlaceProp(kind, targetCell.cx, targetCell.cz);
+      shotSound(weaponId);
+      return;
+    }
     placeBarricade(world.grid, world.scene, barricades, targetCell.cx, targetCell.cz, kind);
     horde.fieldTimer = 0; // recompute next frame → zombies reroute immediately
     // A crate spawned on the player's own tile is now a solid cell: push the
@@ -1471,45 +1665,49 @@ function update(dt: number, nowMs: number): void {
   cameraRig.update(cameraPlayers, dt);
   if (isOnline) publishPresence();
 
-  // waves — spawn relative to the first alive player
-  const anchor = players.find((p) => p.alive) ?? players[0];
-  const events = updateDirector(
-    director,
-    dt,
-    horde,
-    world.scene,
-    world.grid,
-    anchor.x,
-    anchor.z,
-    zombieSpawnPoints
-  );
-  if (events.waveStarted !== null) {
-    const label = waveEventLabel(director.event);
-    if (label) {
-      showEventBanner(label); // themed banner for special waves
-      audio.spree(); // dramatic sting
-      toast(
-        director.event === 'speedHorde'
-          ? `ტალღა ${events.waveStarted} — SPEED HORDE · RUNNERS ×1.8!`
-          : `ტალღა ${events.waveStarted} — BLACKOUT! · გამოიყენე ფარა!`,
-        3
-      );
-    } else {
-      toast(`ტალღა ${events.waveStarted}!`, 2);
-    }
-  }
-  if (events.waveCleared !== null) {
-    // wave completion: living players come back at FULL health (balance knob)
-    for (const player of players) {
-      if (WAVE_CONFIG.fullHpRestoreOnWaveEnd) healToFull(player);
-      // refill any weapon that is below a full magazine (never reduces);
-      // downed players stay downed — their revive timer keeps ticking.
-      for (const [weaponId, ammo] of player.ammo) {
-        const mag = getWeapon(weaponId).magSize;
-        if (mag > 0 && ammo < mag) player.ammo.set(weaponId, mag);
+  // waves — spawn relative to the first alive player. Online, the room runs the
+  // director and mirrors it into `director` + our one-shot `waveStart`/`waveClear`
+  // events, so the local state machine is skipped entirely.
+  if (!isOnline) {
+    const anchor = players.find((p) => p.alive) ?? players[0];
+    const events = updateDirector(
+      director,
+      dt,
+      horde,
+      world.scene,
+      world.grid,
+      anchor.x,
+      anchor.z,
+      zombieSpawnPoints
+    );
+    if (events.waveStarted !== null) {
+      const label = waveEventLabel(director.event);
+      if (label) {
+        showEventBanner(label); // themed banner for special waves
+        audio.spree(); // dramatic sting
+        toast(
+          director.event === 'speedHorde'
+            ? `ტალღა ${events.waveStarted} — SPEED HORDE · RUNNERS ×1.8!`
+            : `ტალღა ${events.waveStarted} — BLACKOUT! · გამოიყენე ფარა!`,
+          3
+        );
+      } else {
+        toast(`ტალღა ${events.waveStarted}!`, 2);
       }
     }
-    toast(`ტალღა ${events.waveCleared} გადალახული! · +100% HP RESTORED`, 3.5);
+    if (events.waveCleared !== null) {
+      // wave completion: living players come back at FULL health (balance knob)
+      for (const player of players) {
+        if (WAVE_CONFIG.fullHpRestoreOnWaveEnd) healToFull(player);
+        // refill any weapon that is below a full magazine (never reduces);
+        // downed players stay downed — their revive timer keeps ticking.
+        for (const [weaponId, ammo] of player.ammo) {
+          const mag = getWeapon(weaponId).magSize;
+          if (mag > 0 && ammo < mag) player.ammo.set(weaponId, mag);
+        }
+      }
+      toast(`ტალღა ${events.waveCleared} გადალახული! · +100% HP RESTORED`, 3.5);
+    }
   }
 
   // blackout / night-wave lighting: dim the arena, aim each player's flashlight
@@ -1519,21 +1717,24 @@ function update(dt: number, nowMs: number): void {
   // Pulse the perimeter gate warning lamps while the wave is disgorging mobs.
   updateSpawnGateWarnings(world, dt, director.phase === 'spawning');
 
-  // horde AI → per-player damage + any barrels the horde destroyed
-  const hordeEvents = updateHorde(horde, {
-    dt,
-    players,
-    grid: world.grid,
-    barricades,
-    scene: world.scene,
-    projectiles,
-  });
-  hordeEvents.playerDamage.forEach((amount, index) => {
-    const player = players[index];
-    if (player) applyDamage(player, amount);
-  });
-  for (const ruined of hordeEvents.destroyedBarrels) explodeAt(ruined.x, ruined.z, null);
-  if (phase !== 'playing') return; // game over mid-frame
+  // horde AI → per-player damage + any barrels the horde destroyed. Online the
+  // room simulates the horde and forwards melee damage as `damagePlayer`.
+  if (!isOnline) {
+    const hordeEvents = updateHorde(horde, {
+      dt,
+      players,
+      grid: world.grid,
+      barricades,
+      scene: world.scene,
+      projectiles,
+    });
+    hordeEvents.playerDamage.forEach((amount, index) => {
+      const player = players[index];
+      if (player) applyDamage(player, amount);
+    });
+    for (const ruined of hordeEvents.destroyedBarrels) explodeAt(ruined.x, ruined.z, null);
+    if (phase !== 'playing') return; // game over mid-frame
+  }
 
   // player projectiles / fireballs / explosions
   const projectileEvents = updateProjectiles(
@@ -1543,21 +1744,34 @@ function update(dt: number, nowMs: number): void {
     dt,
     currentProjectileWorld()
   );
-  projectileEvents.playerDamage.forEach((amount, index) => {
-    const player = players[index];
-    if (player) applyDamage(player, amount);
-  });
-  for (const explosion of projectileEvents.explosions) applyExplosion(explosion);
+  if (isOnline) {
+    // Fireballs are server-owned now; only our own projectile blasts are
+    // reported, and the room resolves their damage, chains and kills.
+    for (const explosion of projectileEvents.explosions) reportLocalExplosion(explosion);
+  } else {
+    projectileEvents.playerDamage.forEach((amount, index) => {
+      const player = players[index];
+      if (player) applyDamage(player, amount);
+    });
+    for (const explosion of projectileEvents.explosions) applyExplosion(explosion);
+  }
   if (phase !== 'playing') return;
 
   updateMines();
-  updateChainFuses(dt); // staggered barrel chain reactions
+  if (!isOnline) updateChainFuses(dt); // staggered barrel chain reactions (offline)
 
-  // pickups
-  for (const collected of updatePickups(world.scene, pickups, dt, players)) {
-    const player = players[collected.playerIndex];
-    audio.pickup();
-    toast(`${player?.character ?? ''}: ${collected.message}`, 2);
+  // pickups — online the room grants the item (walk-over is only a request), and
+  // the mirror animates the ground cubes; offline collection stays as before.
+  if (isOnline) {
+    const local = players[0];
+    if (local && onlineLobby) onlineWorld.collectDrops(onlineLobby, local);
+    onlineWorld.update(onlineContext(), dt);
+  } else {
+    for (const collected of updatePickups(world.scene, pickups, dt, players)) {
+      const player = players[collected.playerIndex];
+      audio.pickup();
+      toast(`${player?.character ?? ''}: ${collected.message}`, 2);
+    }
   }
 
   // HUD — one independent status card per player, re-bound every frame.
@@ -1674,6 +1888,46 @@ Object.defineProperty(globalThis, '__game_shoot', {
     },
     get pickups(): Pickup[] {
       return pickups;
+    },
+    /** Test hook: how many entities the server-authoritative mirror renders. */
+    get mirrored(): { enemies: number; props: number; drops: number } {
+      return {
+        enemies: onlineWorld.mirroredEnemies,
+        props: onlineWorld.mirroredProps,
+        drops: onlineWorld.mirroredDrops,
+      };
+    },
+    /** Test hook: the exact server entity ids this client is rendering. */
+    get mirroredIds(): { enemies: number[]; props: string[]; drops: number[] } {
+      return {
+        enemies: onlineWorld.enemyIds(),
+        props: onlineWorld.propCells(),
+        drops: onlineWorld.dropIds(),
+      };
+    },
+    /**
+     * Test hook: deploy a prop through the real online path when online (the
+     * room validates + replicates it), or the local path otherwise.
+     */
+    placeProp(kind: 'barrel' | 'crate', cx: number, cz: number): void {
+      if (isOnline && onlineLobby) onlineLobby.requestPlaceProp(kind, cx, cz);
+      else placeBarricade(world.grid, world.scene, barricades, cx, cz, kind);
+    },
+    /** Test hook: damage a rendered mob (reported to the room when online). */
+    hitEnemy(index: number, damage: number, weaponId: number): void {
+      const zombie = horde.zombies[index];
+      if (!zombie) return;
+      if (isOnline) {
+        const id = onlineWorld.enemyIdOf(zombie);
+        if (id !== undefined) onlineLobby?.reportEnemyHit(id, damage, weaponId);
+        return;
+      }
+      damageZombie(zombie, damage, players[0] ?? null, null);
+    },
+    /** Test hook: damage one specific server mob id (online only). */
+    hitEnemyId(id: number, damage: number, weaponId: number): void {
+      if (!isOnline) return;
+      onlineLobby?.reportEnemyHit(id, damage, weaponId);
     },
     get projectiles(): Projectile[] {
       return projectiles;

@@ -41,6 +41,12 @@ export interface ExplosionEvent {
   z: number;
   radius: number;
   damage: number;
+  /**
+   * Flat per-player blast damage when the source ignored falloff (grenade /
+   * mine). Undefined for distance-scaled blasts (rocket, barrel). The online
+   * client forwards this so the server reproduces the same blast rules.
+   */
+  flatPlayerDamage?: number;
   /** victim index → accumulated damage (zombies use the horde array index). */
   zombieDamage: Map<number, number>;
   /** player index → accumulated damage (self-friendly fire included). */
@@ -196,6 +202,7 @@ export function explode(
     z: spec.z,
     radius: spec.radius,
     damage: spec.damage,
+    flatPlayerDamage: spec.playerDamage,
     zombieDamage: new Map(),
     playerDamage: new Map(),
   };

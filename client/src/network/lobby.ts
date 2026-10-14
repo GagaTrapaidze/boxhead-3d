@@ -20,6 +20,14 @@ import {
   ROOM_CODE_LENGTH,
 } from '../../../shared/src/constants.ts';
 import { DEFAULT_MAP_ID } from '../../../shared/src/maps.ts';
+import {
+  dropKindFromCode,
+  enemyKindFromCode,
+  propKindCode,
+  propKindFromCode,
+} from '../../../shared/src/loot.ts';
+import type { DropKind, EnemyKind, PropKind } from '../../../shared/src/loot.ts';
+import type { WaveEventKind } from '../../../shared/src/waveEvents.ts';
 import { SERVER_URL } from './serverUrl.ts';
 
 /** Coarse connection lifecycle surfaced to the UI. */
@@ -43,6 +51,83 @@ export interface OnlinePlayer {
   weapon: number;
 }
 
+/** One authoritative mob as seen in the synchronized room state. */
+export interface OnlineEnemy {
+  /** Stable server-assigned id (the map key, parsed back to a number). */
+  id: number;
+  kind: EnemyKind;
+  x: number;
+  z: number;
+  /** Facing angle in radians. */
+  dir: number;
+  hp: number;
+  maxHp: number;
+  /** Devil only: phase-2 rage (burning / dashing) is active. */
+  phase2: boolean;
+  /** sessionId of the player this mob is chasing ("" = none). */
+  target: string;
+}
+
+/** One authoritative deployable (explosive barrel or wooden crate). */
+export interface OnlineProp {
+  kind: PropKind;
+  cx: number;
+  cz: number;
+  hp: number;
+  maxHp: number;
+}
+
+/** One authoritative ground drop. */
+export interface OnlineDrop {
+  id: number;
+  kind: DropKind;
+  x: number;
+  z: number;
+  /** Seconds until the server despawns it. */
+  ttl: number;
+}
+
+/** One fiery floor patch left by a phase-2 Devil dash. */
+export interface OnlineHazard {
+  x: number;
+  z: number;
+  radius: number;
+  life: number;
+  maxLife: number;
+}
+
+/** One Devil fireball in flight. */
+export interface OnlineFireball {
+  x: number;
+  z: number;
+  dirX: number;
+  dirZ: number;
+}
+
+/** One-shot event: a mob died (the room decides when, everyone reacts at once). */
+export interface EnemyKilledEvent {
+  id: number;
+  kind: EnemyKind;
+  x: number;
+  z: number;
+  /** sessionId of the client whose hit killed it ("" = the horde itself). */
+  killer: string;
+}
+
+/** One-shot event: a barrel detonated (play the blast FX). */
+export interface ExplosionEvent {
+  x: number;
+  z: number;
+  radius: number;
+}
+
+/** One-shot event: a deployable was destroyed (barrel blast or crate splinters). */
+export interface PropDestroyedEvent {
+  kind: PropKind;
+  cx: number;
+  cz: number;
+}
+
 /** A stable snapshot of the room the UI and game loop can read. */
 export interface RoomInfo {
   /** 6-char shareable room code. */
@@ -57,6 +142,17 @@ export interface RoomInfo {
   matchOver: boolean;
   /** Players ordered by seat (index 0 first). */
   players: OnlinePlayer[];
+  /** Wave director mirrored from the server. */
+  wave: number;
+  event: WaveEventKind;
+  directorPhase: 'intermission' | 'spawning' | 'active';
+  directorTimer: number;
+  /** Authoritative world entities. */
+  enemies: OnlineEnemy[];
+  props: OnlineProp[];
+  drops: OnlineDrop[];
+  hazards: OnlineHazard[];
+  fireballs: OnlineFireball[];
 }
 
 /** The transform sample the game loop sends ~20 Hz once playing. */
@@ -75,6 +171,20 @@ export interface LobbyHandlers {
   onRoom: (info: RoomInfo | null) => void;
   /** Fires exactly once when the room transitions lobby → playing. */
   onStart: (info: RoomInfo) => void;
+  /** A mob died — play its death FX (and credit it when we landed the blow). */
+  onEnemyKilled: (event: EnemyKilledEvent) => void;
+  /** A deployable was destroyed by the server. */
+  onPropDestroyed: (event: PropDestroyedEvent) => void;
+  /** A barrel blast happened — play the flash / shake at that point. */
+  onExplosion: (event: ExplosionEvent) => void;
+  /** The server dealt damage to this client's player (melee / hazard / blast). */
+  onDamagePlayer: (amount: number) => void;
+  /** A walk-over pickup was granted by the server. */
+  onGranted: (kind: DropKind) => void;
+  /** A new wave started (banner + toast). */
+  onWaveStart: (wave: number, event: WaveEventKind) => void;
+  /** A wave was cleared (full-HP restore + magazine refill). */
+  onWaveClear: (wave: number) => void;
 }
 
 const PRESENCE_INTERVAL_MS = 50; // 20 Hz, matching the server's snapshot cadence
@@ -95,16 +205,71 @@ interface RawPlayer {
   weapon: number;
 }
 
+interface RawEnemy {
+  id: number;
+  kind: number;
+  x: number;
+  z: number;
+  dir: number;
+  hp: number;
+  maxHp: number;
+  phase2: boolean;
+  target: string;
+}
+
+interface RawProp {
+  kind: number;
+  cx: number;
+  cz: number;
+  hp: number;
+  maxHp: number;
+}
+
+interface RawDrop {
+  id: number;
+  kind: number;
+  x: number;
+  z: number;
+  ttl: number;
+}
+
+interface RawHazard {
+  x: number;
+  z: number;
+  radius: number;
+  life: number;
+  maxLife: number;
+}
+
+interface RawFireball {
+  x: number;
+  z: number;
+  dirX: number;
+  dirZ: number;
+}
+
+/** A Colyseus map-like collection (MapSchema). */
+interface RawMap<T> {
+  size: number;
+  forEach: (callback: (value: T, key: string) => void) => void;
+}
+
 interface RawState {
   code: string;
   hostId: string;
   mapId: string;
   phase: string;
   matchOver: boolean;
-  players: {
-    size: number;
-    forEach: (callback: (player: RawPlayer, key: string) => void) => void;
-  };
+  wave: number;
+  event: string;
+  directorPhase: string;
+  directorTimer: number;
+  players: RawMap<RawPlayer>;
+  enemies: RawMap<RawEnemy>;
+  props: RawMap<RawProp>;
+  drops: RawMap<RawDrop>;
+  hazards: RawMap<RawHazard>;
+  fireballs: RawMap<RawFireball>;
 }
 
 function readReconnectToken(): string | null {
@@ -122,6 +287,11 @@ function writeReconnectToken(token: string | null): void {
   } catch {
     /* storage unavailable — reconnection simply won't survive a reload */
   }
+}
+
+/** Coerces a wire event string into the shared `WaveEventKind` union. */
+function normalizeEvent(value: unknown): WaveEventKind {
+  return value === 'speedHorde' || value === 'blackout' ? value : 'none';
 }
 
 /** Human-readable message for a matchmaking/connection failure. */
@@ -198,6 +368,48 @@ export class Lobby {
     this.room?.send('death');
   }
 
+  // --- authoritative world messages ----------------------------------------
+
+  /**
+   * Reports damage this client resolved against a mob (its own shot). The room
+   * applies it, kills/destroys as needed and broadcasts the result.
+   */
+  reportEnemyHit(enemyId: number, damage: number, weaponId: number): void {
+    if (damage <= 0) return;
+    this.room?.send('damageEnemy', { id: enemyId, damage, weaponId });
+  }
+
+  /** Reports shot damage to a deployed barrel / crate at a grid cell. */
+  reportPropDamage(cx: number, cz: number, damage: number): void {
+    if (damage <= 0) return;
+    this.room?.send('damageProp', { cx, cz, damage });
+  }
+
+  /** Asks the room to deploy a barrel / crate on a grid cell (server-validated). */
+  requestPlaceProp(kind: PropKind, cx: number, cz: number): void {
+    this.room?.send('placeProp', { kind: propKindCode(kind), cx, cz });
+  }
+
+  /** Reports walking over a drop — the room grants the item and removes it. */
+  requestPickup(dropId: number, x: number, z: number): void {
+    this.room?.send('pickupItem', { id: dropId, x, z });
+  }
+
+  /**
+   * Reports a blast this client resolved (grenade / rocket / mine). The room owns
+   * the outcome: mob damage, prop chains, kills and player damage.
+   * `playerDamage` of -1 means "scale with distance" (barrels); 0 = mobs only.
+   */
+  reportExplosion(
+    x: number,
+    z: number,
+    radius: number,
+    damage: number,
+    playerDamage: number
+  ): void {
+    this.room?.send('explode', { x, z, radius, damage, playerDamage });
+  }
+
   /** Host only, lobby only: changes the arena everyone will play. */
   setMap(mapId: string): void {
     this.room?.send('setMap', { mapId });
@@ -243,6 +455,39 @@ export class Lobby {
       this.handlers.onStatus('error', `სერვერის შეცდომა (${code}): ${message ?? ''}`);
     });
     room.onLeave((code) => this.handleLeave(code));
+
+    // One-shot world events — every client reacts to these at the same instant.
+    room.onMessage('enemyKilled', (msg: { id: number; kind: number; x: number; z: number; killer: string }) => {
+      this.handlers.onEnemyKilled({
+        id: msg.id,
+        kind: enemyKindFromCode(msg.kind),
+        x: msg.x,
+        z: msg.z,
+        killer: msg.killer ?? '',
+      });
+    });
+    room.onMessage('propDestroyed', (msg: { kind: number; cx: number; cz: number }) => {
+      this.handlers.onPropDestroyed({
+        kind: propKindFromCode(msg.kind),
+        cx: msg.cx,
+        cz: msg.cz,
+      });
+    });
+    room.onMessage('explosion', (msg: { x: number; z: number; radius: number }) => {
+      this.handlers.onExplosion({ x: msg.x, z: msg.z, radius: msg.radius });
+    });
+    room.onMessage('damagePlayer', (msg: { amount: number }) => {
+      this.handlers.onDamagePlayer(msg.amount);
+    });
+    room.onMessage('granted', (msg: { kind: number }) => {
+      this.handlers.onGranted(dropKindFromCode(msg.kind));
+    });
+    room.onMessage('waveStart', (msg: { wave: number; event: string }) => {
+      this.handlers.onWaveStart(msg.wave, normalizeEvent(msg.event));
+    });
+    room.onMessage('waveClear', (msg: { wave: number }) => {
+      this.handlers.onWaveClear(msg.wave);
+    });
 
     this.handleState(); // initial state may already be present
   }
@@ -308,7 +553,64 @@ export class Lobby {
     });
     players.sort((a, b) => a.seat - b.seat);
 
+    const enemies: OnlineEnemy[] = [];
+    state.enemies?.forEach((enemy) => {
+      enemies.push({
+        id: enemy.id,
+        kind: enemyKindFromCode(enemy.kind),
+        x: enemy.x,
+        z: enemy.z,
+        dir: enemy.dir ?? 0,
+        hp: enemy.hp,
+        maxHp: enemy.maxHp,
+        phase2: enemy.phase2 === true,
+        target: enemy.target ?? '',
+      });
+    });
+
+    const props: OnlineProp[] = [];
+    state.props?.forEach((prop) => {
+      props.push({
+        kind: propKindFromCode(prop.kind),
+        cx: prop.cx,
+        cz: prop.cz,
+        hp: prop.hp,
+        maxHp: prop.maxHp,
+      });
+    });
+
+    const drops: OnlineDrop[] = [];
+    state.drops?.forEach((drop) => {
+      drops.push({
+        id: drop.id,
+        kind: dropKindFromCode(drop.kind),
+        x: drop.x,
+        z: drop.z,
+        ttl: drop.ttl ?? 0,
+      });
+    });
+
+    const hazards: OnlineHazard[] = [];
+    state.hazards?.forEach((hazard) => {
+      hazards.push({
+        x: hazard.x,
+        z: hazard.z,
+        radius: hazard.radius,
+        life: hazard.life,
+        maxLife: hazard.maxLife,
+      });
+    });
+
+    const fireballs: OnlineFireball[] = [];
+    state.fireballs?.forEach((ball) => {
+      fireballs.push({ x: ball.x, z: ball.z, dirX: ball.dirX, dirZ: ball.dirZ });
+    });
+
     const phase = state.phase === 'playing' ? 'playing' : 'lobby';
+    const directorPhase =
+      state.directorPhase === 'spawning' || state.directorPhase === 'active'
+        ? state.directorPhase
+        : 'intermission';
     return {
       code: state.code ?? room.roomId,
       hostId: state.hostId ?? '',
@@ -318,6 +620,15 @@ export class Lobby {
       isHost: state.hostId === room.sessionId,
       matchOver: state.matchOver === true,
       players,
+      wave: state.wave ?? 0,
+      event: normalizeEvent(state.event),
+      directorPhase,
+      directorTimer: state.directorTimer ?? 0,
+      enemies,
+      props,
+      drops,
+      hazards,
+      fireballs,
     };
   }
 

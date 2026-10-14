@@ -85,6 +85,11 @@ export interface Zombie {
   hazTimer: number;
   /** Pulse clock driving the rage light / flame animation. */
   ragePulse: number;
+  /**
+   * Online mode only: the server-reported facing the mesh eases toward. Unset
+   * in local play, where the AI writes the mesh rotation directly.
+   */
+  dirTarget?: number;
 }
 
 /** A lingering fiery floor patch left behind by a phase-2 Devil dash. */
