@@ -142,6 +142,19 @@ test('drop table: 0.70x frequency knob, uzi the most common weapon drop', () => 
   assert.ok(DROP_CONFIG.pickupAwards.uzi >= 150, 'uzi cubes award 150 rounds');
 });
 
+test('loot pickups credit score to the shared co-op pool', () => {
+  assert.ok(DROP_CONFIG.pickupScore > 0, 'a pickup must be worth score');
+  assert.ok(
+    DROP_CONFIG.pickupScore >= ENEMY_CONFIG.walker.score,
+    'a team pickup is worth at least a walker kill'
+  );
+  assert.equal(
+    WAVE_CONFIG.pickupScore,
+    DROP_CONFIG.pickupScore,
+    'the wave table mirrors the drop table'
+  );
+});
+
 test('weapon cadence & ammo rules (pistol −25%, rapid uzi, infinite pistol)', () => {
   // the pistol fired every 250 ms before; +33% delay == 25% slower cadence
   assert.ok(PISTOL_CONFIG.fireIntervalMs >= 1.33 * 250,

@@ -38,6 +38,15 @@ const HAZARD_GEOMETRY = new THREE.PlaneGeometry(1, 1);
 
 /** How quickly a mob mesh closes the gap to its last server position. */
 const ENEMY_LERP_RATE = 14;
+/**
+ * A walk-over request that the room ignored (it validated the pickup against its
+ * own, slightly older copy of the player position) is re-sent after this delay.
+ * Without it a request that races the ~20 Hz presence relay could leave a cube
+ * on the ground forever — half of the co-op desync the mirror exists to prevent.
+ */
+const PICKUP_RETRY_MS = 350;
+/** Give up after this many attempts (the room clearly disagrees about range). */
+const MAX_PICKUP_TRIES = 6;
 
 interface EnemyTarget {
   x: number;
@@ -54,8 +63,8 @@ export class OnlineWorld {
   private readonly propProxies = new Map<string, Barricade>();
   /** server drop id → the local pickup proxy. */
   private readonly dropProxies = new Map<number, Pickup>();
-  /** Drop ids we already asked the room for (so we don't spam the message). */
-  private readonly requested = new Set<number>();
+  /** Drop ids we asked the room for, with the retry clock (see `collectDrops`). */
+  private readonly requested = new Map<number, { at: number; tries: number }>();
   private readonly hazardMeshes: THREE.Mesh[] = [];
   /** One render slot per server projectile; `kind` is tracked so a pooled slot
    * is rebuilt when a fireball index is reused by a spinner (or vice versa). */
@@ -292,16 +301,26 @@ export class OnlineWorld {
   }
 
   /**
-   * Sends one `pickupItem` per drop the local player is standing on. Deduped by
-   * id until the room answers, so a slow round-trip never spams the message.
+   * Sends one `pickupItem` per drop the local player is standing on. A drop the
+   * room has already granted is gone from `dropProxies` by the next snapshot, so
+   * anything still mirrored is re-asked (bounded) — this keeps a walk-over from
+   * silently failing when the request beats the presence relay to the server.
    */
-  collectDrops(lobby: Lobby, player: Player): void {
+  collectDrops(lobby: Lobby, player: Player, now: number = performance.now()): void {
     if (!player.alive) return;
     for (const [id, proxy] of this.dropProxies) {
-      if (this.requested.has(id)) continue;
-      if (Math.hypot(player.x - proxy.x, player.z - proxy.z) > PICKUP_RADIUS) continue;
-      this.requested.add(id);
-      lobby.requestPickup(id, player.x, player.z);
+      const standing = Math.hypot(player.x - proxy.x, player.z - proxy.z) <= PICKUP_RADIUS;
+      const pending = this.requested.get(id);
+      if (pending) {
+        if (!standing || pending.tries >= MAX_PICKUP_TRIES) continue;
+        if (now - pending.at < PICKUP_RETRY_MS) continue;
+        pending.at = now;
+        pending.tries += 1;
+      } else {
+        if (!standing) continue;
+        this.requested.set(id, { at: now, tries: 1 });
+      }
+      lobby.requestPickup(id, proxy.x, proxy.z);
     }
   }
 
@@ -336,6 +355,11 @@ export class OnlineWorld {
   /** "cx,cz" cells of every rendered prop (sorted). */
   propCells(): string[] {
     return [...this.propProxies.keys()].sort();
+  }
+
+  /** Every rendered drop with its server position — used by the browser checks. */
+  dropPoints(): { id: number; x: number; z: number }[] {
+    return [...this.dropProxies].map(([id, proxy]) => ({ id, x: proxy.x, z: proxy.z }));
   }
 
   /** Server drop ids currently rendered (sorted). */

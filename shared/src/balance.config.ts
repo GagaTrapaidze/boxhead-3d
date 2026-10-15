@@ -425,12 +425,17 @@ export interface DropBalance {
   pickupRadius: number;
   /** HP restored by a health-pack drop (boss loot). */
   healthRestore: number;
+  /** Score credited to the shared team pool when *any* player walks over a
+   * drop. In co-op this reaches both players at once (state.teamScore). */
+  pickupScore: number;
 }
 
 /** Base drop chance before the global frequency multiplier (35% drop rate). */
 const BASE_DROP_RATE = 0.35;
 /** Global drop-frequency multiplier: 0.70 = exactly 30% fewer drops. */
 const DROP_MULTIPLIER = 0.7;
+/** Team score one loot pickup is worth (above a walker's 10, below a Devil's 100). */
+const DROP_PICKUP_SCORE = 25;
 
 /**
  * THE drop-tuning table. `mobDropMultiplier: 0.70` reduces the overall drop
@@ -463,6 +468,7 @@ export const DROP_CONFIG: DropBalance = {
   pickupBlinkInterval: 0.15,
   pickupRadius: 0.9,
   healthRestore: 50,
+  pickupScore: DROP_PICKUP_SCORE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -493,6 +499,8 @@ export interface WaveBalance {
   pickupRadius: number;
   /** HP restored by a health-pack drop (boss loot). */
   healthRestore: number;
+  /** Team score one loot pickup adds to the shared co-op pool. */
+  pickupScore: number;
 }
 
 /** The −30% drop-frequency knob, re-exported for tests and engine imports.
@@ -513,6 +521,7 @@ export const WAVE_CONFIG: WaveBalance = {
   pickupBlinkInterval: DROP_CONFIG.pickupBlinkInterval,
   pickupRadius: DROP_CONFIG.pickupRadius,
   healthRestore: DROP_CONFIG.healthRestore,
+  pickupScore: DROP_CONFIG.pickupScore,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -785,10 +794,10 @@ export const ENEMY_CONFIG: EnemyBalance = {
   devilDashWindup: 0.5,
   devilDashSpeedMultiplier: 2.5,
   devilDashDuration: 1.2,
-  devilTrailLife: 2.0,
+  devilTrailLife: 3.5,
   devilTrailDamage: 10,
   devilTrailTick: 0.5,
-  devilTrailDropInterval: 0.09,
+  devilTrailDropInterval: 0.25,
   devilTrailRadius: 0.55,
 };
 

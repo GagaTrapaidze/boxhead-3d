@@ -34,7 +34,7 @@ import {
   SNAPSHOT_RATE,
   TICK_MS,
 } from '../../../shared/src/constants.ts';
-import { COOP_CONFIG } from '../../../shared/src/balance.config.ts';
+import { COOP_CONFIG, ENEMY_CONFIG, WAVE_CONFIG } from '../../../shared/src/balance.config.ts';
 import { DEFAULT_MAP_ID, getMap } from '../../../shared/src/maps.ts';
 import { dropKindCode, enemyKindCode, propKindCode } from '../../../shared/src/loot.ts';
 import type { PropKind } from '../../../shared/src/loot.ts';
@@ -171,6 +171,12 @@ export const CoopRoomState = schema(
     phase: 'string',
     /** true once every player is down at once — Game Over for the whole room. */
     matchOver: 'boolean',
+    /**
+     * Shared team score. Every kill (base score × the shooter's combo) and
+     * every loot pickup credits this ONE pool, so both clients patch to the
+     * same number in the same instant — co-op can never desync on score.
+     */
+    teamScore: 'uint32',
     /** Wave director: current wave, its themed event and phase/timer. */
     wave: 'uint16',
     event: 'string',
@@ -207,6 +213,8 @@ const PATCH_INTERVAL_MS = 1000 / SNAPSHOT_RATE;
 const MAX_HIT_DAMAGE = 1000;
 /** Largest blast radius a client may report (rocket/barell blasts are ≤ 5). */
 const MAX_EXPLOSION_RADIUS = 12;
+/** Hard ceiling on a client-reported combo multiplier (score-input guard). */
+const MAX_SCORE_MULTIPLIER = 1000;
 
 function randomRoomCode(): string {
   let code = '';
@@ -237,6 +245,15 @@ function clamp(value: unknown, min: number, max: number, fallback: number): numb
   return Math.min(max, Math.max(min, n));
 }
 
+/**
+ * Normalises a client-reported combo multiplier: whole numbers ≥ 1, capped so a
+ * rogue client cannot mint unbounded score.
+ */
+function comboMultiplier(value: unknown): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 1;
+  return Math.min(MAX_SCORE_MULTIPLIER, Math.max(1, n));
+}
+
 /** Reads a grid coordinate from a message, or null when it is not an integer. */
 function readCell(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isInteger(value)) return null;
@@ -252,6 +269,13 @@ export class CoopRoom extends Room {
 
   /** Authoritative world simulation (enemies / props / drops / hazards). */
   private sim: WorldSim = new WorldSim(DEFAULT_MAP_ID);
+  /**
+   * Last combo multiplier each client reported with its presence sample. A kill
+   * is scored `base × this`, which is exactly the value the shooter's own HUD
+   * shows at the moment of the killing blow — resolved server-side so every
+   * client patches the same team total.
+   */
+  private readonly combos = new Map<string, number>();
 
   override onCreate(options: CoopJoinOptions = {}): void {
     this.roomId = allocateRoomCode();
@@ -262,6 +286,7 @@ export class CoopRoom extends Room {
     this.state.phase = 'lobby';
     this.state.matchOver = false;
     this.state.mapId = getMap(options.mapId ?? DEFAULT_MAP_ID).id;
+    this.state.teamScore = 0;
     this.state.wave = 0;
     this.state.event = 'none';
     this.state.directorPhase = 'intermission';
@@ -284,6 +309,7 @@ export class CoopRoom extends Room {
       player.aimZ = clamp(msg?.aimZ, -1, 1, player.aimZ);
       player.hp = clamp(msg?.hp, 0, PLAYER_MAX_HP, player.hp);
       player.weapon = clamp(msg?.weapon, 0, 255, player.weapon);
+      this.combos.set(client.sessionId, comboMultiplier(msg?.mult));
     });
 
     // --- map choice: host-only, lobby-only -----------------------------------
@@ -378,7 +404,14 @@ export class CoopRoom extends Room {
       if (id === null) return;
       // Trust the *server's* copy of the player position, not the message's.
       const kind = this.sim.pickup(id, player.x, player.z);
-      if (kind) client.send('granted', { kind: dropKindCode(kind) });
+      if (!kind) return;
+      // The drop itself is gone from `sim.drops` → it leaves `state.drops` on
+      // this same tick, so the cube vanishes for BOTH clients immediately.
+      // Loot is a shared team benefit: it credits the team pool and is granted
+      // to *every* client (each applies it to its own player), never just the
+      // collector.
+      this.state.teamScore += WAVE_CONFIG.pickupScore;
+      this.broadcast('granted', { kind: dropKindCode(kind), by: client.sessionId });
     });
 
     // Fixed-rate clock (shared TICK_RATE, 30 Hz): advances the world and the
@@ -402,6 +435,9 @@ export class CoopRoom extends Room {
     });
     // A fresh (or re-rolled) world: clears mobs, props, drops and the director.
     this.sim.reset(this.state.mapId);
+    // A fresh match starts from zero team score (restart included).
+    this.state.teamScore = 0;
+    this.combos.clear();
     this.syncWorld();
     this.setMetadata({ code: this.state.code, mapId: this.state.mapId, phase: 'playing' });
   }
@@ -449,6 +485,10 @@ export class CoopRoom extends Room {
   private flushEvents(): void {
     for (const event of this.sim.drainEvents()) {
       if (event.type === 'enemyKilled') {
+        // Score is credited here, once, for the whole room: base score × the
+        // killer's combo — so both players' HUDs show the same total.
+        const multiplier = event.killer ? this.combos.get(event.killer) ?? 1 : 1;
+        this.state.teamScore += ENEMY_CONFIG[event.kind].score * multiplier;
         this.broadcast('enemyKilled', {
           id: event.id,
           kind: enemyKindCode(event.kind),
@@ -717,6 +757,7 @@ export class CoopRoom extends Room {
   private removePlayer(sessionId: string): void {
     // A departed player never keeps the single-curse slot alive.
     this.sim.clearCurse(sessionId);
+    this.combos.delete(sessionId);
     this.state.players.delete(sessionId);
     if (this.state.hostId === sessionId) {
       // Elect the lowest-seated remaining player as the new host.

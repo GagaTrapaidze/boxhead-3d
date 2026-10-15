@@ -174,6 +174,11 @@ export interface RoomInfo {
   isHost: boolean;
   /** True once every player is down at once — Game Over for the whole room. */
   matchOver: boolean;
+  /**
+   * Shared team score owned by the room: kills and loot credit this one pool, so
+   * every client renders the identical number on the same patch.
+   */
+  teamScore: number;
   /** Players ordered by seat (index 0 first). */
   players: OnlinePlayer[];
   /** Wave director mirrored from the server. */
@@ -197,6 +202,9 @@ export interface PresenceSample {
   aimZ: number;
   hp: number;
   weapon: number;
+  /** Current kill-combo multiplier — the room scores kills with it so the team
+   * total matches what the shooter's own HUD reads. */
+  mult: number;
 }
 
 export interface LobbyHandlers {
@@ -215,8 +223,9 @@ export interface LobbyHandlers {
   onShockwave: (event: ShockwaveEvent) => void;
   /** The server dealt damage to this client's player (melee / hazard / blast). */
   onDamagePlayer: (amount: number) => void;
-  /** A walk-over pickup was granted by the server. */
-  onGranted: (kind: DropKind) => void;
+  /** A walk-over pickup was granted by the server (broadcast to every client,
+   * so both players receive the shared loot benefit). `by` = collector. */
+  onGranted: (kind: DropKind, by: string) => void;
   /** A new wave started (banner + toast). */
   onWaveStart: (wave: number, event: WaveEventKind) => void;
   /** A wave was cleared (full-HP restore + magazine refill). */
@@ -305,6 +314,7 @@ interface RawState {
   mapId: string;
   phase: string;
   matchOver: boolean;
+  teamScore: number;
   wave: number;
   event: string;
   directorPhase: string;
@@ -532,8 +542,8 @@ export class Lobby {
     room.onMessage('damagePlayer', (msg: { amount: number }) => {
       this.handlers.onDamagePlayer(msg.amount);
     });
-    room.onMessage('granted', (msg: { kind: number }) => {
-      this.handlers.onGranted(dropKindFromCode(msg.kind));
+    room.onMessage('granted', (msg: { kind: number; by?: string }) => {
+      this.handlers.onGranted(dropKindFromCode(msg.kind), msg.by ?? '');
     });
     room.onMessage('waveStart', (msg: { wave: number; event: string }) => {
       this.handlers.onWaveStart(msg.wave, normalizeEvent(msg.event));
@@ -686,6 +696,7 @@ export class Lobby {
       selfId: room.sessionId,
       isHost: state.hostId === room.sessionId,
       matchOver: state.matchOver === true,
+      teamScore: state.teamScore ?? 0,
       players,
       wave: state.wave ?? 0,
       event: normalizeEvent(state.event),

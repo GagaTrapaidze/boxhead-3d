@@ -143,6 +143,7 @@ const multVal = byId('multVal');
 const multFill = byId('multfill');
 const mult2 = byId('mult2');
 const scoreEl = byId('score');
+const scoreLabelEl = byId('scoreLabel');
 const waveEl = byId('wave');
 const powerupEl = byId('powerup');
 const powerTimeEl = byId('powerTime');
@@ -458,6 +459,7 @@ function startGame(selectedMode: StartMode, mapId: string = lastMapId): void {
   lastMapId = mapId;
   mode = selectedMode;
   isOnline = false; // local match — drop any online-only actors
+  scoreLabelEl.textContent = 'ქულა';
   input?.dispose();
   input = new InputManager(mode);
 
@@ -603,6 +605,9 @@ function publishPresence(): void {
     aimZ: local.aimZ,
     hp: Math.round(local.hp),
     weapon: local.weapon,
+    // The room scores every kill with the shooter's live combo, so its shared
+    // team total always matches the multiplier this client is showing.
+    mult: local.mult,
   });
 }
 
@@ -777,6 +782,8 @@ function startOnlineMatch(info: RoomInfo): void {
       : currentMap.zombieSpawns.map((s) => ({ x: s.x, z: s.y }));
 
   isOnline = true;
+  // The HUD score is the room's shared team pool in co-op, not a per-player one.
+  scoreLabelEl.textContent = 'TEAM ქულა';
   localSeat = Math.max(0, info.players.findIndex((p) => p.sessionId === info.selfId));
   const start = spawnForSeat(localSeat);
   players.push(
@@ -803,6 +810,10 @@ function handleRoomUpdate(info: RoomInfo | null): void {
   onlineInfo = info;
   setRoomInfo(info);
   if (!info || !isOnline || phase !== 'playing') return;
+
+  // The room owns the score online: mirror the shared team pool so every client
+  // (and the game-over summary) reads the identical authoritative number.
+  score = info.teamScore;
 
   // The server declares Game Over the moment every player is down at once.
   if (info.matchOver) {
@@ -858,16 +869,20 @@ function createLobby(): Lobby {
       const local = players[0];
       if (local) applyDamage(local, amount);
     },
-    onGranted: (kind) => {
+    onGranted: (kind, by) => {
       const local = players[0];
       if (!local) return;
       audio.pickup();
+      // The room broadcasts every pickup to BOTH clients and each one applies
+      // it to its own player, so loot is a shared co-op benefit.
       const message = applyPickup(local, kind);
       if (local.weapon !== local._lastWeaponId) {
         updateWeaponMesh(local.mesh, local.weapon);
         local._lastWeaponId = local.weapon;
       }
-      toast(`${local.character}: ${message}`, 2);
+      const collector =
+        by && by !== onlineInfo?.selfId ? onlineInfo?.players.find((p) => p.sessionId === by) : null;
+      toast(`${collector?.name ?? local.character}: ${message}`, 2);
     },
     onWaveStart: (wave, event) => handleRemoteWaveStart(wave, event),
     onWaveClear: (wave) => handleRemoteWaveClear(wave),
@@ -884,9 +899,10 @@ function handleEnemyKilled(event: {
   z: number;
   killer: string;
 }): void {
-  const stats = ENEMY_CONFIG[event.kind as 'walker' | 'runner' | 'devil' | 'blackDevil'];
+  // The room already credited this kill to the shared team pool (base score ×
+  // the shooter's combo) and the state patch mirrors it onto both HUDs, so only
+  // the local stat/combo bookkeeping happens here.
   const owner = event.killer !== '' && event.killer === onlineInfo?.selfId ? players[0] ?? null : null;
-  score += stats.score * (owner ? owner.mult : 1);
   if (owner) {
     owner.kills += 1;
     registerKill(owner);
@@ -2098,6 +2114,10 @@ Object.defineProperty(globalThis, '__game_shoot', {
         props: onlineWorld.propCells(),
         drops: onlineWorld.dropIds(),
       };
+    },
+    /** Test hook: every rendered drop with its server position. */
+    get dropPoints(): { id: number; x: number; z: number }[] {
+      return onlineWorld.dropPoints();
     },
     /**
      * Test hook: deploy a prop through the real online path when online (the

@@ -20,7 +20,10 @@
  *    mob removed from state for everyone;
  *  - kills roll loot into `state.drops`, and `pickupItem` grants + removes it for
  *    both clients;
- *  - the wave director is mirrored into the room state.
+ *  - the wave director is mirrored into the room state;
+ *  - the shared team score (`state.teamScore`) is credited by the room for kills
+ *    and loot, patches the identical value to both clients, and resets on a
+ *    restart (both clients' HUDs therefore can never disagree).
  */
 import { Client } from 'colyseus.js';
 
@@ -29,6 +32,10 @@ const ROOM = 'coop';
 /** Barrel wire code 0 / crate 1 (shared/src/loot.ts PROP_KINDS order). */
 const PROP_BARREL = 0;
 const PROP_CRATE = 1;
+/** Kill score per enemy kind (shared/src/loot.ts ENEMY_KINDS order). */
+const ENEMY_SCORE = [10, 15, 100, 500]; // walker, runner, devil, blackDevil
+/** Team score one loot pickup is worth (balance.config DROP_CONFIG.pickupScore). */
+const DROP_PICKUP_SCORE = 25;
 
 function waitFor(room, predicate, label, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
@@ -84,6 +91,8 @@ let hostRoom;
 let guestRoom;
 /** Keeps both players parked mid-arena at full HP so targeting stays stable. */
 let presenceTimer;
+/** Combo multiplier the host keeps reporting (drives the server-side scoring). */
+let hostMult = 1;
 
 try {
   console.log(`[online-world-check] connecting to ${URL}`);
@@ -98,8 +107,8 @@ try {
 
   // Park both players in the arena's open plaza so mobs have a real target.
   presenceTimer = setInterval(() => {
-    hostRoom.send('presence', { x: 20, z: 20, aimX: 1, aimZ: 0, hp: 100, weapon: 0 });
-    guestRoom.send('presence', { x: 21, z: 20, aimX: -1, aimZ: 0, hp: 100, weapon: 0 });
+    hostRoom.send('presence', { x: 20, z: 20, aimX: 1, aimZ: 0, hp: 100, weapon: 0, mult: hostMult });
+    guestRoom.send('presence', { x: 21, z: 20, aimX: -1, aimZ: 0, hp: 100, weapon: 0, mult: 1 });
   }, 100);
 
   // --- 1. server-authored mobs -------------------------------------------
@@ -132,6 +141,10 @@ try {
   assert(
     typeof hostRoom.state.directorPhase === 'string',
     `director phase mirrored (${hostRoom.state.directorPhase})`
+  );
+  assert(
+    hostRoom.state.teamScore === 0,
+    'a fresh match opens on a zeroed shared team score'
   );
 
   // --- 2. server-owned props --------------------------------------------
@@ -171,11 +184,53 @@ try {
   // --- 3. mob death + loot ----------------------------------------------
   console.log('\n[3] mob death and loot');
   const victimId = [...hostRoom.state.enemies.values()][0].id;
+  const teamScoreBefore = hostRoom.state.teamScore;
   const killMessage = nextMessage(guestRoom, 'enemyKilled');
   hostRoom.send('damageEnemy', { id: victimId, damage: 10000, weaponId: 0 });
   const killed = await killMessage;
   assert(killed.id === victimId, `peer observes the kill of mob ${victimId}`);
   assert(killed.killer === hostRoom.sessionId, 'the kill is credited to the shooter');
+  // The room scores the kill once, into the shared team pool (base × combo).
+  const expectedGain = ENEMY_SCORE[killed.kind] ?? 0;
+  await waitFor(
+    hostRoom,
+    (s) => s.teamScore === teamScoreBefore + expectedGain,
+    'team score credited'
+  );
+  assert(
+    hostRoom.state.teamScore === teamScoreBefore + expectedGain,
+    `kill credited ${expectedGain} to the shared team score (${teamScoreBefore} → ${hostRoom.state.teamScore})`
+  );
+  await waitFor(guestRoom, (s) => s.teamScore === hostRoom.state.teamScore, 'peer mirrors score');
+  assert(
+    guestRoom.state.teamScore === hostRoom.state.teamScore,
+    `both clients show the same score (${guestRoom.state.teamScore})`
+  );
+
+  // A kill credits base × the shooter's live combo, exactly the offline rule.
+  hostMult = 5;
+  await sleep(150); // let the presence pump report the new multiplier
+  const comboVictimId = [...hostRoom.state.enemies.values()][0].id;
+  const comboScoreBefore = hostRoom.state.teamScore;
+  const comboKill = nextMessage(guestRoom, 'enemyKilled');
+  hostRoom.send('damageEnemy', { id: comboVictimId, damage: 10000, weaponId: 0 });
+  const comboKilled = await comboKill;
+  const comboGain = (ENEMY_SCORE[comboKilled.kind] ?? 0) * hostMult;
+  await waitFor(
+    hostRoom,
+    (s) => s.teamScore === comboScoreBefore + comboGain,
+    'combo-scaled kill scored'
+  );
+  assert(
+    hostRoom.state.teamScore === comboScoreBefore + comboGain,
+    `a ×${hostMult} chain credits ${comboGain} to the shared team score`
+  );
+  await waitFor(guestRoom, (s) => s.teamScore === hostRoom.state.teamScore, 'peer score after combo');
+  assert(
+    guestRoom.state.teamScore === hostRoom.state.teamScore,
+    'the peer sees the combo-scaled score too'
+  );
+  hostMult = 1;
   await waitFor(hostRoom, (s) => !s.enemies.get(String(victimId)), 'mob removed from state');
   assert(!hostRoom.state.enemies.get(String(victimId)), 'dead mob left the state for every client');
 
@@ -209,17 +264,54 @@ try {
   presenceTimer = null;
   hostRoom.send('presence', { x: drop.x, z: drop.z, aimX: 1, aimZ: 0, hp: 100, weapon: 0 });
   await sleep(200);
+  const scoreBeforePickup = hostRoom.state.teamScore;
+  const peerGranted = nextMessage(guestRoom, 'granted'); // the peer must hear it too
   const granted = nextMessage(hostRoom, 'granted');
   hostRoom.send('pickupItem', { id: drop.id, x: drop.x, z: drop.z });
   const award = await granted;
+  const sharedAward = await peerGranted;
   assert(typeof award.kind === 'number', `pickup granted (kind ${award.kind})`);
+  assert(
+    sharedAward.kind === award.kind,
+    'the loot award is broadcast to BOTH players (shared benefit)'
+  );
+  assert(award.by === hostRoom.sessionId, 'the award names the collecting player');
+  // The grant is written into the room state in the same message as the score,
+  // but the client copy lands on the next state patch — wait for it.
+  await waitFor(
+    hostRoom,
+    (s) => s.teamScore === scoreBeforePickup + DROP_PICKUP_SCORE,
+    'team score credited by the pickup'
+  );
+  assert(
+    hostRoom.state.teamScore === scoreBeforePickup + DROP_PICKUP_SCORE,
+    `the pickup credited ${DROP_PICKUP_SCORE} to the shared team score (${scoreBeforePickup} → ${hostRoom.state.teamScore})`
+  );
+  await waitFor(guestRoom, (s) => s.teamScore === hostRoom.state.teamScore, 'peer score after loot');
+  assert(
+    guestRoom.state.teamScore === hostRoom.state.teamScore,
+    'both clients agree on the score after the pickup'
+  );
   await waitFor(guestRoom, (s) => !s.drops.get(String(drop.id)), 'drop removed for the peer');
   assert(
     !guestRoom.state.drops.get(String(drop.id)),
     'collected drop left the state for every client'
   );
 
-  console.log('\n[online-world-check] PASS — server owns mobs, props and drops');
+  // --- 4. team score across a restart ------------------------------------
+  console.log('\n[4] shared team score owns the match lifecycle');
+  assert(hostRoom.state.teamScore > 0, 'the team score accumulated over the match');
+  hostRoom.send('death');
+  guestRoom.send('death');
+  await waitFor(hostRoom, (s) => s.matchOver === true, 'both players down → Game Over');
+  hostRoom.send('start'); // host-only restart
+  await waitFor(hostRoom, (s) => s.phase === 'playing' && !s.matchOver, 'restart accepted');
+  await waitFor(guestRoom, (s) => s.phase === 'playing' && !s.matchOver, 'peer restarted too');
+  assert(hostRoom.state.teamScore === 0, 'a restart resets the shared team score to 0');
+  await waitFor(guestRoom, (s) => s.teamScore === 0, 'peer sees the reset');
+  assert(guestRoom.state.teamScore === 0, 'both clients agree the new match starts at 0');
+
+  console.log('\n[online-world-check] PASS — server owns mobs, props, drops and the team score');
 } catch (error) {
   console.error(`\n[online-world-check] ${error.message}`);
   process.exitCode = 1;
