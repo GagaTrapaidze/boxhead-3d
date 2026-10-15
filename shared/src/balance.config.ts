@@ -859,7 +859,7 @@ export const DIRECTOR_CONFIG: DirectorBalance = {
   runnerFromWave: 2,
   devilFromWave: 3,
   maxDevils: 4,
-  blackDevilWave: 1,
+  blackDevilWave: 7,
   blackDevilMobCountMultiplier: 0.5,
   /** Last-ditch sprint: no downtime once the wave is nearly cleared. */
   enrageThreshold: 3,
