@@ -37,6 +37,7 @@ import {
   ringSweepHitsCircle,
 } from '../../../shared/src/shockwave.ts';
 import type { ShockwaveRing } from '../../../shared/src/shockwave.ts';
+import { stepAngleToward } from '../../../shared/src/steering.ts';
 import {
   advanceCurse,
   canApplyCurse,
@@ -1012,6 +1013,16 @@ export class WorldSim {
             enemy.hazTimer = 0;
           }
         } else if (enemy.phase2 && enemy.dashState === 'dash') {
+          // Homing charge: steer the committed heading toward the target's LIVE
+          // position with a bounded turn rate, so the Devil curves after its
+          // prey and drips fire along that real path instead of flying straight
+          // past a frozen aim point. `target` is already the nearest living
+          // player, so in co-op it hunts whoever is closest right now.
+          const current = Math.atan2(enemy.dashDirX, enemy.dashDirZ);
+          const desired = Math.atan2(toTargetX, toTargetZ);
+          const steered = stepAngleToward(current, desired, ENEMY_CONFIG.devilDashTurnRate * dt);
+          enemy.dashDirX = Math.sin(steered);
+          enemy.dashDirZ = Math.cos(steered);
           dirX = enemy.dashDirX;
           dirZ = enemy.dashDirZ;
           speedScale = ENEMY_CONFIG.devilDashSpeedMultiplier;
@@ -1156,6 +1167,12 @@ export class WorldSim {
       if (meleeDistance <= ATTACK_RANGE + enemy.radius * 0.5 && enemy.attackCooldown <= 0) {
         this.playerDamage.set(target.id, (this.playerDamage.get(target.id) ?? 0) + enemy.damage);
         enemy.attackCooldown = ATTACK_COOLDOWN;
+        // A charging Devil ends its rush the instant it lands the hit, then
+        // falls back to its cooldown / normal chase speed (see balance.config).
+        if (enemy.kind === 'devil' && enemy.dashState === 'dash') {
+          enemy.dashState = 'idle';
+          enemy.dashTimer = ENEMY_CONFIG.devilDashInterval;
+        }
       }
     }
   }

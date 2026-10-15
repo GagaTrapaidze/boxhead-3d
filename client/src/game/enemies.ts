@@ -36,6 +36,7 @@ import {
   ringSweepHitsCircle,
 } from '../../../shared/src/shockwave.ts';
 import type { ShockwaveRing } from '../../../shared/src/shockwave.ts';
+import { stepAngleToward } from '../../../shared/src/steering.ts';
 import { canApplyCurse, createCurseState } from '../../../shared/src/curse.ts';
 import { SpatialHash } from './spatialHash.ts';
 
@@ -611,7 +612,8 @@ export function updateHorde(horde: Horde, ctx: HordeUpdateContext): HordeEvents 
       zombie.mesh.rotation.y = Math.atan2(toTargetX, toTargetZ);
 
       if (zombie.phase2 && zombie.dashState === 'windup') {
-        // Telegraph: stand still for the wind-up, then commit to the locked heading.
+        // Telegraph: stand still for the wind-up, then commit to the charge
+        // (whose heading then homes after the player's live position).
         frozen = true;
         zombie.dashTimer -= dt;
         if (zombie.dashTimer <= 0) {
@@ -620,7 +622,16 @@ export function updateHorde(horde: Horde, ctx: HordeUpdateContext): HordeEvents 
           zombie.hazTimer = 0;
         }
       } else if (zombie.phase2 && zombie.dashState === 'dash') {
-        // Charge straight along the locked heading, dripping fiery hazard.
+        // Homing charge: steer the committed heading toward the target's LIVE
+        // position with a bounded turn rate, so the Devil curves after its
+        // prey and drips fire along that real path instead of flying straight
+        // past a frozen aim point. `target` is already the nearest living
+        // player, so in co-op it hunts whoever is closest right now.
+        const current = Math.atan2(zombie.dashDirX, zombie.dashDirZ);
+        const desired = Math.atan2(toTargetX, toTargetZ);
+        const steered = stepAngleToward(current, desired, ENEMY_CONFIG.devilDashTurnRate * dt);
+        zombie.dashDirX = Math.sin(steered);
+        zombie.dashDirZ = Math.cos(steered);
         dirX = zombie.dashDirX;
         dirZ = zombie.dashDirZ;
         speedScale = ENEMY_CONFIG.devilDashSpeedMultiplier;
@@ -752,6 +763,12 @@ export function updateHorde(horde: Horde, ctx: HordeUpdateContext): HordeEvents 
     if (meleeDistance <= ATTACK_RANGE + zombie.radius * 0.5 && zombie.attackCooldown <= 0) {
       damage[target.index] += zombie.damage;
       zombie.attackCooldown = ATTACK_COOLDOWN_MS / 1000;
+      // A charging Devil ends its rush the instant it lands the hit, then
+      // falls back to its cooldown / normal chase speed (see balance.config).
+      if (zombie.kind === 'devil' && zombie.dashState === 'dash') {
+        zombie.dashState = 'idle';
+        zombie.dashTimer = ENEMY_CONFIG.devilDashInterval;
+      }
     }
   }
 

@@ -13,7 +13,7 @@
     "server"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test shared/test/bytes.test.ts shared/test/quantize.test.ts shared/test/constants.test.ts shared/test/codec.test.ts shared/test/grid.test.ts shared/test/weapons.test.ts shared/test/flowfield.test.ts shared/test/combo.test.ts shared/test/balance.test.ts shared/test/maps.test.ts shared/test/barricade.test.ts shared/test/revive.test.ts shared/test/waveEvents.test.ts shared/test/blackDevil.test.ts shared/test/blackDevil.world.test.ts shared/test/gameConfig.test.ts",
+    "test": "node --experimental-strip-types --test shared/test/bytes.test.ts shared/test/quantize.test.ts shared/test/constants.test.ts shared/test/codec.test.ts shared/test/grid.test.ts shared/test/weapons.test.ts shared/test/flowfield.test.ts shared/test/combo.test.ts shared/test/balance.test.ts shared/test/maps.test.ts shared/test/barricade.test.ts shared/test/revive.test.ts shared/test/waveEvents.test.ts shared/test/blackDevil.test.ts shared/test/blackDevil.world.test.ts shared/test/gameConfig.test.ts shared/test/steering.test.ts shared/test/devilDash.test.ts",
     "typecheck": "tsc -p shared/tsconfig.json && tsc -p server/tsconfig.json && tsc -p client/tsconfig.json",
     "dev:server": "node --experimental-strip-types --watch server/src/index.ts",
     "dev:client": "npm run dev --workspace client"

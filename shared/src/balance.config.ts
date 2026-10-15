@@ -704,8 +704,13 @@ export interface EnemyBalance {
   devilDashWindup: number;
   /** Charge speed multiplier applied to the Devil's base speed. */
   devilDashSpeedMultiplier: number;
-  /** Maximum duration of a single dash charge. */
+  /** Maximum duration of a single dash charge (the charge also ends the
+   * instant it lands a melee hit on a player). */
   devilDashDuration: number;
+  /** Maximum angular turn rate while charging, in radians/second. The Devil
+   * steers toward its target's live position with this cap, so the rush curves
+   * after the player (menacing, still dodgeable) instead of flying straight. */
+  devilDashTurnRate: number;
   /** Seconds a fiery hazard patch keeps burning on the floor. */
   devilTrailLife: number;
   /** Damage a trail patch deals per tick to a player standing on it. */
@@ -797,6 +802,9 @@ export const ENEMY_CONFIG: EnemyBalance = {
   devilDashWindup: 0.5,
   devilDashSpeedMultiplier: 2.5,
   devilDashDuration: 3.5,
+  // ~137°/s: the charge visibly curves after a strafing player, but a fast
+  // circling player can still out-turn it at close range (dodgeable).
+  devilDashTurnRate: 2.4,
   devilTrailLife: 3.5,
   devilTrailDamage: 10,
   devilTrailTick: 0.5,

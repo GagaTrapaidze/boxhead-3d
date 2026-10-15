@@ -7,7 +7,8 @@ Full design: [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 Playable single-player/local co-op vs. waves, plus a working online mode where
 the Colyseus room owns the whole **shared world**: mobs, barrels/crates, loot,
-wave director, the Devil's fireballs/hazards and explosive chains. Clients render
+wave director, the Devil's fireballs/hazards, its phase-2 homing fire-trail charge
+and explosive chains. Clients render
 that world from the room state and report the shots they resolve (see
 **Authoritative world** below). Monorepo foundation + shared packages in place:
 
@@ -80,6 +81,10 @@ node scripts/local-revive-check.mjs    # needs dev:client + Chrome on :9333
 # eases dark from it on, stays dark on later waves, and the blackout event
 # darkens an early wave — driven over CDP against the real render loop
 node scripts/darkness-check.mjs        # needs dev:client + Chrome on :9333
+
+# Red Devil phase-2 charge: a perpendicularly-committed dash steers its heading
+# toward the live player instead of holding the frozen vector (offline client)
+node scripts/devil-dash-check.mjs      # needs dev:client + Chrome on :9333
 
 # Wave-7 Black Devil boss: black mesh + dedicated top-centre "BLACK DEVIL" HP
 # bar, the 3 u/4.5 s shockwave, the 1 s → 3.5 s tracking laser, the 4-cube

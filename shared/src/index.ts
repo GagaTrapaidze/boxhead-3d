@@ -7,6 +7,7 @@ export * from './protocol/messages.ts';
 export * from './protocol/codec.ts';
 export * from './grid.ts';
 export * from './flowfield.ts';
+export * from './steering.ts';
 export * from './shockwave.ts';
 export * from './curse.ts';
 export * from './combo.ts';
