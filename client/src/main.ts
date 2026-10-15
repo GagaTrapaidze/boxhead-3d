@@ -21,11 +21,19 @@ import {
   COMBO_CONFIG,
   COOP_CONFIG,
   CRATE_CONFIG,
+  DIRECTOR_CONFIG,
   ENEMY_CONFIG,
   JUICE_CONFIG,
   WAVE_CONFIG,
 } from '../../shared/src/balance.config.ts';
 import { advanceRevive, isInReviveCircle } from '../../shared/src/revive.ts';
+import {
+  CURSE_CLEANSE_SECONDS,
+  advanceCurse,
+  createCurseState,
+  curseProgress,
+  isInCurseCircle,
+} from '../../shared/src/curse.ts';
 import { waveEventLabel } from '../../shared/src/waveEvents.ts';
 import type { WaveEventKind } from '../../shared/src/waveEvents.ts';
 
@@ -83,12 +91,15 @@ import {
 import type { Barricade, BarricadeKind } from './game/barricades.ts';
 import { NightMode } from './game/lighting.ts';
 import { ReviveCircle } from './game/reviveCircle.ts';
+import { CurseCircle } from './game/curseCircle.ts';
+import type { CursedMarker } from './game/curseCircle.ts';
 import { explode, spawnPlayerProjectile, updateProjectiles } from './game/projectiles.ts';
 import type { ExplosionEvent, Flash, Projectile, ProjectileWorld } from './game/projectiles.ts';
-import { applyPickup, rollDropKind, spawnPickup, updatePickups } from './game/pickups.ts';
+import { applyPickup, rollDropKind, spawnBossLoot, spawnPickup, updatePickups } from './game/pickups.ts';
 import type { Pickup } from './game/pickups.ts';
 import type { PickupKind } from './game/actors.ts';
 import { FxLayer } from './game/fx.ts';
+import { BossFx } from './game/bossFx.ts';
 import { GibLayer } from './game/gibs.ts';
 import { audio } from './game/audio.ts';
 import {
@@ -136,9 +147,12 @@ const messageEl = byId('message');
 const flashEl = byId('flash');
 const reviveLabelEl = byId('reviveLabel');
 const mateLabelsWrap = byId('mateLabels');
+const curseLabelsWrap = byId('curseLabels');
 const comboBannerEl = byId('comboBanner');
 const eventBannerEl = byId('eventBanner');
 const waveTimerEl = byId('waveTimer');
+const bossBar = byId('bossBar');
+const bossFill = byId('bossFill');
 
 /** DOM handles for one split-screen player status card. */
 interface PlayerCard {
@@ -313,9 +327,19 @@ const gibs = new GibLayer(world.scene);
 // around whichever player is currently downed.
 const reviveCircle = new ReviveCircle(world.scene);
 
+// Black Devil curse cleansing zones — the 2 u floor circles drawn around every
+// cursed player, doubled as the radial cleanse-hold progress indicator.
+const curseCircle = new CurseCircle(world.scene);
+/** Scratch marker list rebuilt each frame (capacity is tiny — never grows). */
+const curseMarkers: CursedMarker[] = [];
+
 // Blackout-wave lighting rig: dims the arena and hands every player a
 // flashlight cone along their facing (see game/lighting.ts).
 const nightMode = new NightMode(world);
+
+// Black Devil boss FX: the telegraphed laser line/beam and the radial
+// shockwave rings (see game/bossFx.ts). Driven by the simulated boss state.
+const bossFx = new BossFx(world.scene);
 
 /** Blast profile of an explosive barrel (single source of truth: the table). */
 const BARREL_BLAST = getWeapon(WeaponId.Barrel);
@@ -408,9 +432,11 @@ function clearWorld(): void {
   removeMeshes(pickups);
   fx.reset();
   gibs.reset();
+  bossFx.reset();
   chainFuses = [];
   hitStopTimer = 0;
   reviveCircle.hide();
+  curseCircle.hide();
   nightMode.reset();
 
   for (const player of players) removePlayerMesh(world.scene, player);
@@ -498,6 +524,10 @@ function applyPresence(player: Player, presence: OnlinePlayer): void {
   player.hp = presence.hp;
   player.x = presence.x;
   player.z = presence.z;
+  // Server-authoritative curse: the room owns the tick/cleanse clocks online.
+  player.cursed = presence.cursed;
+  player.cleanseProgress = presence.cleanseProgress;
+  player.curse = null;
   const length = Math.hypot(presence.aimX, presence.aimZ);
   if (length > 1e-4) {
     player.aimX = presence.aimX / length;
@@ -600,6 +630,10 @@ function syncLocalPlayer(info: RoomInfo): void {
   const me = info.players.find((p) => p.sessionId === info.selfId);
   if (!local || !me) return;
 
+  // Curse status is server-owned online: mirror it for the ground circle + HUD.
+  local.cursed = me.cursed;
+  local.cleanseProgress = me.cleanseProgress;
+  local.curse = null;
   local.reviveTimer = me.respawnTimer;
   if (!me.alive) {
     if (!local.downed) enterOnlineDowned(local);
@@ -677,6 +711,47 @@ function updateMateLabels(): void {
   for (let i = remotePlayers.length; i < mateLabelPool.length; i++) {
     mateLabelPool[i].hidden = true;
   }
+}
+
+/** Pooled "CURSED / CLEANSING" labels stacked above cursed bodies. */
+const curseLabelPool: HTMLDivElement[] = [];
+function curseLabelAt(index: number): HTMLDivElement {
+  let label = curseLabelPool[index];
+  if (!label) {
+    label = document.createElement('div');
+    label.className = 'curseLabel';
+    curseLabelsWrap.append(label);
+    curseLabelPool[index] = label;
+  }
+  return label;
+}
+
+/**
+ * Paints the cleansing circle + progress label for every cursed player (the
+ * local player and, online, each mirrored peer). Runs every frame in both
+ * modes; the underlying state is local offline and server-mirrored online.
+ */
+function updateCurseVisuals(): void {
+  curseMarkers.length = 0;
+  let labelIndex = 0;
+  const add = (player: Player): void => {
+    if (!player.cursed || !player.alive) return;
+    const progress = Math.max(0, Math.min(1, player.cleanseProgress));
+    curseMarkers.push({ x: player.x, z: player.z, progress });
+    const label = curseLabelAt(labelIndex++);
+    const pos = projectToScreen(player.x, 2.4, player.z);
+    label.hidden = false;
+    label.textContent =
+      progress > 0
+        ? `CLEANSING ${(CURSE_CLEANSE_SECONDS * (1 - progress)).toFixed(1)}s`
+        : 'CURSED!';
+    label.style.left = `${pos.left.toFixed(1)}px`;
+    label.style.top = `${pos.top.toFixed(1)}px`;
+  };
+  for (const player of players) add(player);
+  for (const remote of remotePlayers) add(remote);
+  for (let i = labelIndex; i < curseLabelPool.length; i++) curseLabelPool[i].hidden = true;
+  curseCircle.update(curseMarkers);
 }
 
 /** Launches an online match from a room snapshot (host and joiners alike). */
@@ -767,6 +842,7 @@ function createLobby(): Lobby {
       }
     },
     onExplosion: (event) => handleServerExplosion(event.x, event.z, event.radius),
+    onShockwave: (event) => handleBossShockwave(event.x, event.z, event.radius, event.speed),
     onDamagePlayer: (amount) => {
       const local = players[0];
       if (local) applyDamage(local, amount);
@@ -797,7 +873,7 @@ function handleEnemyKilled(event: {
   z: number;
   killer: string;
 }): void {
-  const stats = ENEMY_CONFIG[event.kind as 'walker' | 'runner' | 'devil'];
+  const stats = ENEMY_CONFIG[event.kind as 'walker' | 'runner' | 'devil' | 'blackDevil'];
   const owner = event.killer !== '' && event.killer === onlineInfo?.selfId ? players[0] ?? null : null;
   score += stats.score * (owner ? owner.mult : 1);
   if (owner) {
@@ -812,11 +888,24 @@ function handleEnemyKilled(event: {
   }
   audio.zombieDeath();
   const gibCount =
-    event.kind === 'devil'
+    event.kind === 'devil' || event.kind === 'blackDevil'
       ? JUICE_CONFIG.gibCountBoss
       : JUICE_CONFIG.gibCountMin +
         Math.floor(Math.random() * (JUICE_CONFIG.gibCountMax - JUICE_CONFIG.gibCountMin + 1));
   gibs.burst(event.x, event.z, gibCount);
+}
+
+/**
+ * The Black Devil's radial shockwave (both modes): plays the expanding energy
+ * ring, a subtle screen shake and the pressure-wave sound. `speed` is the
+ * server's expansion speed, so the visual ring reaches each victim at the exact
+ * tick the collision sweep does. The damage itself is applied by whoever owns
+ * the simulation (local AI offline, the room online).
+ */
+function handleBossShockwave(x: number, z: number, radius: number, speed?: number): void {
+  bossFx.shockwave(x, z, radius, speed);
+  cameraRig?.addTrauma(JUICE_CONFIG.shockwaveTrauma);
+  audio.shockwave();
 }
 
 /** Plays the blast flash for a server-confirmed explosion (ours are skipped). */
@@ -853,8 +942,21 @@ function reportLocalExplosion(explosion: ExplosionEvent): void {
   if (pendingLocalExplosions.length > 32) pendingLocalExplosions.shift();
 }
 
+// --- wave-event banner -------------------------------------------------------
+
+/** Pops the "BLACK DEVIL!" boss-wave banner and its ominous sting. */
+function announceBossWave(wave: number): void {
+  showEventBanner('BLACK DEVIL!');
+  audio.spree();
+  toast(`ტალღა ${wave} — BLACK DEVIL BOSS! · მოკალი, სანამ ლაზერი მოგკლავს`, 3.5);
+}
+
 /** Themed wave banner/toast for a server-declared wave (both clients agree). */
 function handleRemoteWaveStart(wave: number, event: WaveEventKind): void {
+  if (wave === DIRECTOR_CONFIG.blackDevilWave) {
+    announceBossWave(wave);
+    return;
+  }
   const label = waveEventLabel(event);
   if (label) {
     showEventBanner(label);
@@ -1373,8 +1475,9 @@ function applyExplosion(explosion: ExplosionEvent): void {
  * and exactly two destroy it, while standard mobs keep their one-hit kill.
  */
 function explosiveDamageTo(zombie: Zombie, amount: number): number {
-  if (zombie.kind !== 'devil') return amount;
-  return Math.min(amount, ENEMY_CONFIG.devil.explosiveDamageCap);
+  if (zombie.kind === 'devil') return Math.min(amount, ENEMY_CONFIG.devil.explosiveDamageCap);
+  if (zombie.kind === 'blackDevil') return Math.min(amount, ENEMY_CONFIG.blackDevil.explosiveDamageCap);
+  return amount;
 }
 
 function damageZombie(
@@ -1408,14 +1511,58 @@ function damageZombie(
   }
   // Voxel gib burst — a handful for mobs, a shower for the boss.
   const gibCount =
-    zombie.kind === 'devil'
+    zombie.kind === 'devil' || zombie.kind === 'blackDevil'
       ? JUICE_CONFIG.gibCountBoss
       : JUICE_CONFIG.gibCountMin +
         Math.floor(Math.random() * (JUICE_CONFIG.gibCountMax - JUICE_CONFIG.gibCountMin + 1));
   gibs.burst(zombie.x, zombie.z, gibCount);
   removeZombie(horde, world.scene, zombie);
+  // The Black Devil dies in a 3–4 reward "loot explosion" (health packs,
+  // special ammo, barrels). Every other mob keeps its single drop roll.
+  if (zombie.kind === 'blackDevil') {
+    spawnBossLoot(world.scene, pickups, zombie.x, zombie.z);
+    return;
+  }
   const drop = rollDropKind();
   if (drop) spawnPickup(world.scene, pickups, zombie.x, zombie.z, drop);
+}
+
+/**
+ * Offline curse tick: advance every cursed local player's clocks, apply the
+ * ticking damage, and lift the curse when a teammate finishes the 3 s hold.
+ * Online the room runs an identical loop and mirrors the result through the
+ * schema, so this is skipped there.
+ */
+function updateLocalCurses(dt: number): void {
+  for (const player of players) {
+    if (!player.cursed && !player.curse) continue;
+    // A downed player's curse lapses with the run — no ticking through death.
+    if (!player.alive) {
+      player.curse = null;
+      player.cursed = false;
+      player.cleanseProgress = 0;
+      continue;
+    }
+    if (!player.curse) player.curse = createCurseState();
+    const cleansed = players.some(
+      (other) =>
+        other !== player &&
+        other.alive &&
+        isInCurseCircle(player.x, player.z, other.x, other.z)
+    );
+    const step = advanceCurse(player.curse, dt, cleansed);
+    if (step.damage > 0) applyDamage(player, step.damage);
+    if (step.cleansed) {
+      player.curse = null;
+      player.cursed = false;
+      player.cleanseProgress = 0;
+      audio.pickup();
+      toast(`P${player.index + 1}: CURSE LIFTED!`, 2.5);
+    } else {
+      player.cursed = true;
+      player.cleanseProgress = curseProgress(player.curse);
+    }
+  }
 }
 
 function applyDamage(player: Player, amount: number): void {
@@ -1682,7 +1829,9 @@ function update(dt: number, nowMs: number): void {
     );
     if (events.waveStarted !== null) {
       const label = waveEventLabel(director.event);
-      if (label) {
+      if (director.wave === DIRECTOR_CONFIG.blackDevilWave) {
+        announceBossWave(director.wave); // Wave 7: Black Devil encounter
+      } else if (label) {
         showEventBanner(label); // themed banner for special waves
         audio.spree(); // dramatic sting
         toast(
@@ -1733,8 +1882,17 @@ function update(dt: number, nowMs: number): void {
       if (player) applyDamage(player, amount);
     });
     for (const ruined of hordeEvents.destroyedBarrels) explodeAt(ruined.x, ruined.z, null);
+    for (const wave of hordeEvents.shockwaves) {
+      handleBossShockwave(wave.x, wave.z, wave.radius, wave.speed);
+    }
+    // Curse debuff: bleed ticking damage and let a teammate's 3 s hold cleanse
+    // it. Online the room owns all of this (mirrored through the schema).
+    updateLocalCurses(dt);
     if (phase !== 'playing') return; // game over mid-frame
   }
+
+  // Black Devil telegraph/beam/ring FX read the (local or mirrored) boss state.
+  bossFx.update(dt, horde.zombies);
 
   // player projectiles / fireballs / explosions
   const projectileEvents = updateProjectiles(
@@ -1780,6 +1938,18 @@ function update(dt: number, nowMs: number): void {
   const p2 = players[1];
   scoreEl.textContent = String(score);
   waveEl.textContent = String(director.wave);
+
+  // Black Devil boss bar — top-centre, one shared bar for every client. The
+  // boss's hp is authoritative (server online, local AI offline) and mirrored
+  // onto the same horde array either way.
+  const boss = horde.zombies.find((zombie) => zombie.alive && zombie.kind === 'blackDevil');
+  if (boss) {
+    bossBar.hidden = false;
+    const ratio = boss.maxHp > 0 ? Math.max(0, Math.min(1, boss.hp / boss.maxHp)) : 0;
+    bossFill.style.width = `${ratio * 100}%`;
+  } else {
+    bossBar.hidden = true;
+  }
   if (p1) {
     updatePlayerCard(card1, p1);
     multVal.textContent = String(p1.mult);
@@ -1818,6 +1988,7 @@ function update(dt: number, nowMs: number): void {
     reviveLabelEl.hidden = true;
   }
   updateMateLabels(); // respawn countdowns above downed teammates
+  updateCurseVisuals(); // curse cleansing circles + progress labels
 
   // Minimal retro intermission countdown, pinned top-centre and hidden the
   // moment the wave starts spawning.
@@ -1873,6 +2044,18 @@ Object.defineProperty(globalThis, '__game_shoot', {
     },
     get director(): Director {
       return director;
+    },
+    /** Test hook: the live Black Devil boss (null when none is on the field). */
+    get boss(): { hp: number; maxHp: number; attackState: string; x: number; z: number } | null {
+      const boss = horde.zombies.find((zombie) => zombie.alive && zombie.kind === 'blackDevil');
+      if (!boss) return null;
+      return {
+        hp: boss.hp,
+        maxHp: boss.maxHp,
+        attackState: boss.attackState,
+        x: boss.x,
+        z: boss.z,
+      };
     },
     get world(): World {
       return world;
@@ -1933,7 +2116,7 @@ Object.defineProperty(globalThis, '__game_shoot', {
       return projectiles;
     },
     /** Test hook: inject a zombie at a world position. */
-    spawnZombie(kind: 'walker' | 'runner' | 'devil', x: number, z: number): void {
+    spawnZombie(kind: 'walker' | 'runner' | 'devil' | 'blackDevil', x: number, z: number): void {
       spawnZombie(horde, world.scene, kind, x, z);
     },
     /** Test hook: deal damage through the real rules (kills / combo / score). */

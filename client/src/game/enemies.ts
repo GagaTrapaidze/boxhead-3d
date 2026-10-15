@@ -10,7 +10,7 @@ import * as THREE from 'three';
 import { GridMap } from '../../../shared/src/grid.ts';
 import { computeFlowField, sampleFlow } from '../../../shared/src/flowfield.ts';
 import type { FlowField } from '../../../shared/src/flowfield.ts';
-import { buildDevil, buildZombie } from './actors.ts';
+import { BLACK_DEVIL_SCALE, DEVIL_SCALE, buildBlackDevil, buildDevil, buildZombie } from './actors.ts';
 import type { Player } from './player.ts';
 import {
   BARRICADE_MELEE_DAMAGE,
@@ -19,7 +19,7 @@ import {
   damageBarricade,
 } from './barricades.ts';
 import type { Barricade } from './barricades.ts';
-import { spawnFireball } from './projectiles.ts';
+import { spawnFireball, spawnSpinner } from './projectiles.ts';
 import type { Projectile } from './projectiles.ts';
 import {
   DIRECTOR_CONFIG,
@@ -29,9 +29,16 @@ import {
 } from '../../../shared/src/balance.config.ts';
 import { waveEventFor } from '../../../shared/src/waveEvents.ts';
 import type { WaveEventKind } from '../../../shared/src/waveEvents.ts';
+import {
+  advanceShockwaveRing,
+  createShockwaveRing,
+  ringSweepHitsCircle,
+} from '../../../shared/src/shockwave.ts';
+import type { ShockwaveRing } from '../../../shared/src/shockwave.ts';
+import { canApplyCurse, createCurseState } from '../../../shared/src/curse.ts';
 import { SpatialHash } from './spatialHash.ts';
 
-export type ZombieKind = 'walker' | 'runner' | 'devil';
+export type ZombieKind = 'walker' | 'runner' | 'devil' | 'blackDevil';
 
 export interface ZombieStats {
   hp: number;
@@ -53,6 +60,8 @@ export const DEVIL_FIRE_RANGE_MAX = ENEMY_CONFIG.devilFireRangeMax;
 /** Hits from weapons at or below this rate-of-fire suppress devil attacks. */
 export const RAPID_FIRE_INTERVAL_MS = ENEMY_CONFIG.rapidFireIntervalMs;
 export const SUPPRESS_DURATION = ENEMY_CONFIG.suppressDuration;
+/** Wave-7 boss tuning (single source: shared/src/balance.config.ts). */
+export const BLACK_DEVIL = ENEMY_CONFIG.blackDevil;
 
 export interface Zombie {
   kind: ZombieKind;
@@ -86,10 +95,44 @@ export interface Zombie {
   /** Pulse clock driving the rage light / flame animation. */
   ragePulse: number;
   /**
+   * Black Devil attack state: 'idle' | 'charge' (1 s laser telegraph) |
+   * 'fire' (3.5 s beam channel). While charge/fire the boss stands still and
+   * every other attack is disabled. Mirrored from the server when online.
+   */
+  attackState: 'idle' | 'charge' | 'fire';
+  /** Countdown within the active laser phase (telegraph or channel). */
+  attackTimer: number;
+  /** Seconds until the next laser telegraph. */
+  laserCooldown: number;
+  /** Beam aim direction (unit vector), ramped with rotational inertia. */
+  laserDirX: number;
+  laserDirZ: number;
+  /** Player the current beam is locked onto (null when idle). */
+  laserTarget: Player | null;
+  /** Countdown to the next beam damage tick. */
+  laserTick: number;
+  /**
+   * Beam reach (world units) after the continuous raycast clamps it at the
+   * first wall / crate. The render stops here and beam damage only applies to
+   * victims in front of that hit point. Mirrored from the server when online.
+   */
+  laserLength: number;
+  /** Seconds until the next radial shockwave is allowed (strict 4.5 s). */
+  shockCooldown: number;
+  /**
    * Online mode only: the server-reported facing the mesh eases toward. Unset
    * in local play, where the AI writes the mesh rotation directly.
    */
   dirTarget?: number;
+}
+
+/**
+ * A live offline shockwave ring: the same expanding annulus the server runs,
+ * plus the set of player indices it has already resolved (each body is hit — or
+ * spared by cover — at most once per wave).
+ */
+export interface ActiveShockwave extends ShockwaveRing {
+  resolved: Set<number>;
 }
 
 /** A lingering fiery floor patch left behind by a phase-2 Devil dash. */
@@ -112,6 +155,8 @@ export interface Horde {
   fieldTimer: number;
   /** Fiery floor patches left by phase-2 Devil dashes. */
   hazards: Hazard[];
+  /** Live expanding Black Devil shockwave rings. */
+  shockwaves: ActiveShockwave[];
 }
 
 export interface HordeUpdateContext {
@@ -124,7 +169,7 @@ export interface HordeUpdateContext {
 }
 
 export function createHorde(): Horde {
-  return { zombies: [], field: null, fieldTimer: 0, hazards: [] };
+  return { zombies: [], field: null, fieldTimer: 0, hazards: [], shockwaves: [] };
 }
 
 /** Shared floor-plane geometry for hazard patches (never disposed). */
@@ -267,8 +312,10 @@ export function spawnZombie(
   z: number
 ): Zombie {
   const stats = ZOMBIE_STATS[kind];
-  const mesh = kind === 'devil' ? buildDevil() : buildZombie();
-  if (kind === 'devil') mesh.scale.setScalar(1.15);
+  const mesh =
+    kind === 'devil' ? buildDevil() : kind === 'blackDevil' ? buildBlackDevil() : buildZombie();
+  if (kind === 'devil') mesh.scale.setScalar(DEVIL_SCALE);
+  else if (kind === 'blackDevil') mesh.scale.setScalar(BLACK_DEVIL_SCALE);
   mesh.position.set(x, 0, z);
   scene.add(mesh);
 
@@ -296,6 +343,15 @@ export function spawnZombie(
     dashDirZ: -1,
     hazTimer: 0,
     ragePulse: 0,
+    attackState: 'idle',
+    attackTimer: 0,
+    laserCooldown: BLACK_DEVIL.laserCooldown * (0.5 + Math.random() * 0.5),
+    laserDirX: 0,
+    laserDirZ: -1,
+    laserTarget: null,
+    laserTick: 0,
+    laserLength: BLACK_DEVIL.laserRange,
+    shockCooldown: 0,
   };
   horde.zombies.push(zombie);
   return zombie;
@@ -357,6 +413,8 @@ export interface HordeEvents {
   playerDamage: number[];
   /** Barrels chewed to destruction this frame — main.ts detonates these. */
   destroyedBarrels: { x: number; z: number }[];
+  /** Radial shockwaves fired this frame — main.ts plays the ring + shake. */
+  shockwaves: { x: number; z: number; radius: number; speed: number }[];
 }
 
 /**
@@ -366,6 +424,7 @@ export interface HordeEvents {
 export function updateHorde(horde: Horde, ctx: HordeUpdateContext): HordeEvents {
   const damage = ctx.players.map(() => 0);
   const destroyedBarrels: { x: number; z: number }[] = [];
+  const shockwaves: { x: number; z: number; radius: number; speed: number }[] = [];
   const { dt, grid, players, barricades, scene, projectiles } = ctx;
   refreshField(horde, ctx);
   const field = horde.field;
@@ -401,7 +460,145 @@ export function updateHorde(horde: Horde, ctx: HordeUpdateContext): HordeEvents 
     let frozen = false;
     let speedScale = 1;
 
-    if (zombie.kind === 'devil') {
+    if (zombie.kind === 'blackDevil') {
+      zombie.mesh.rotation.y = Math.atan2(toTargetX, toTargetZ);
+
+      if (zombie.attackState === 'charge') {
+        // Attack 3, telegraph: hold still and paint an aim line on the target.
+        frozen = true;
+        zombie.attackTimer -= dt;
+        const locked = zombie.laserTarget && zombie.laserTarget.alive ? zombie.laserTarget : target;
+        const ldx = locked.x - zombie.x;
+        const ldz = locked.z - zombie.z;
+        const len = Math.hypot(ldx, ldz) || 1;
+        zombie.laserDirX = ldx / len;
+        zombie.laserDirZ = ldz / len;
+        // Continuous raycast: the telegraph stops at the first wall / crate.
+        zombie.laserLength = grid.raycastDistance(
+          zombie.x,
+          zombie.z,
+          zombie.laserDirX,
+          zombie.laserDirZ,
+          BLACK_DEVIL.laserRange
+        );
+        if (zombie.attackTimer <= 0) {
+          zombie.attackState = 'fire';
+          zombie.attackTimer = BLACK_DEVIL.laserDuration;
+          zombie.laserTick = 0;
+        }
+      } else if (zombie.attackState === 'fire') {
+        // Attack 3, beam: hold still, track with rotational inertia and tick.
+        frozen = true;
+        zombie.attackTimer -= dt;
+        const locked = zombie.laserTarget && zombie.laserTarget.alive ? zombie.laserTarget : target;
+        const desired = Math.atan2(locked.z - zombie.z, locked.x - zombie.x);
+        let delta = desired - Math.atan2(zombie.laserDirZ, zombie.laserDirX);
+        while (delta > Math.PI) delta -= Math.PI * 2;
+        while (delta < -Math.PI) delta += Math.PI * 2;
+        const maxTurn = BLACK_DEVIL.laserTurnRate * dt;
+        const angle =
+          Math.atan2(zombie.laserDirZ, zombie.laserDirX) +
+          Math.max(-maxTurn, Math.min(maxTurn, delta));
+        zombie.laserDirX = Math.cos(angle);
+        zombie.laserDirZ = Math.sin(angle);
+        // Re-clamp the beam each tick so it stops at whatever now blocks it.
+        zombie.laserLength = grid.raycastDistance(
+          zombie.x,
+          zombie.z,
+          zombie.laserDirX,
+          zombie.laserDirZ,
+          BLACK_DEVIL.laserRange
+        );
+        zombie.laserTick -= dt;
+        if (zombie.laserTick <= 0) {
+          zombie.laserTick = BLACK_DEVIL.laserTickInterval;
+          for (const player of players) {
+            if (!player.alive) continue;
+            const ox = player.x - zombie.x;
+            const oz = player.z - zombie.z;
+            const along = ox * zombie.laserDirX + oz * zombie.laserDirZ;
+            if (along < 0 || along > zombie.laserLength) continue;
+            const perpendicular = Math.abs(ox * zombie.laserDirZ - oz * zombie.laserDirX);
+            if (perpendicular > BLACK_DEVIL.laserHalfWidth + PLAYER_CONFIG.radius) continue;
+            if (!grid.lineOfSight(zombie.x, zombie.z, player.x, player.z)) continue;
+            damage[player.index] += BLACK_DEVIL.laserDamage;
+          }
+        }
+        if (zombie.attackTimer <= 0) {
+          zombie.attackState = 'idle';
+          zombie.attackTimer = 0;
+          zombie.laserCooldown = BLACK_DEVIL.laserCooldown;
+          zombie.laserDirX = 0;
+          zombie.laserDirZ = 0;
+          zombie.laserTarget = null;
+        }
+      } else {
+        // Idle: hold the ranged band, defend with the shockwave, then pick
+        // between the laser wind-up and a spinner volley.
+        if (distanceToTarget > BLACK_DEVIL.spinnerRangeMax) {
+          dirX = toTargetX / Math.max(distanceToTarget, 1e-6);
+          dirZ = toTargetZ / Math.max(distanceToTarget, 1e-6);
+        } else if (distanceToTarget < BLACK_DEVIL.spinnerRangeMin) {
+          dirX = -toTargetX / Math.max(distanceToTarget, 1e-6);
+          dirZ = -toTargetZ / Math.max(distanceToTarget, 1e-6);
+        }
+        if (zombie.shockCooldown > 0) zombie.shockCooldown -= dt;
+        if (zombie.laserCooldown > 0) zombie.laserCooldown -= dt;
+        zombie.fireCooldown -= dt;
+
+        const crowded = players.some(
+          (player) =>
+            player.alive &&
+            Math.hypot(player.x - zombie.x, player.z - zombie.z) <=
+              BLACK_DEVIL.shockwaveTriggerRange
+        );
+        if (crowded && zombie.shockCooldown <= 0) {
+          // Spawn a physical expanding ring (not instant radius damage): its
+          // perimeter sweeps the players' bodies over the next few frames.
+          horde.shockwaves.push({
+            ...createShockwaveRing(
+              zombie.x,
+              zombie.z,
+              BLACK_DEVIL.shockwaveRadius,
+              BLACK_DEVIL.shockwaveRingThickness,
+              BLACK_DEVIL.shockwaveExpansionSpeed
+            ),
+            resolved: new Set<number>(),
+          });
+          shockwaves.push({
+            x: zombie.x,
+            z: zombie.z,
+            radius: BLACK_DEVIL.shockwaveRadius,
+            speed: BLACK_DEVIL.shockwaveExpansionSpeed,
+          });
+          zombie.shockCooldown = BLACK_DEVIL.shockwaveCooldown;
+        }
+
+        const hasSight = grid.lineOfSight(zombie.x, zombie.z, target.x, target.z);
+        if (zombie.laserCooldown <= 0 && distanceToTarget <= BLACK_DEVIL.laserRange && hasSight) {
+          zombie.attackState = 'charge';
+          zombie.attackTimer = BLACK_DEVIL.laserTelegraph;
+          zombie.laserTarget = target;
+          zombie.laserDirX = toTargetX / Math.max(distanceToTarget, 1e-6);
+          zombie.laserDirZ = toTargetZ / Math.max(distanceToTarget, 1e-6);
+          zombie.laserLength = grid.raycastDistance(
+            zombie.x,
+            zombie.z,
+            zombie.laserDirX,
+            zombie.laserDirZ,
+            BLACK_DEVIL.laserRange
+          );
+        } else if (
+          zombie.fireCooldown <= 0 &&
+          distanceToTarget <= BLACK_DEVIL.spinnerRangeMax &&
+          hasSight
+        ) {
+          const angle = Math.atan2(target.z - zombie.z, target.x - zombie.x);
+          spawnSpinner(scene, projectiles, zombie.x, zombie.z, angle); // Attack 1
+          zombie.fireCooldown = BLACK_DEVIL.spinnerInterval;
+        }
+      }
+    } else if (zombie.kind === 'devil') {
       // Phase 2 triggers once HP drops to the configured fraction (~one grenade).
       if (!zombie.phase2 && zombie.hp <= zombie.maxHp * ENEMY_CONFIG.devilPhase2HpFraction) {
         zombie.phase2 = true;
@@ -560,7 +757,77 @@ export function updateHorde(horde: Horde, ctx: HordeUpdateContext): HordeEvents 
   // Fiery trail damage from phase-2 dashes.
   updateHazards(horde, scene, dt, players, damage);
 
-  return { playerDamage: damage, destroyedBarrels };
+  // Expand the Black Devil's shockwave rings and resolve their swept contacts.
+  stepShockwaves(horde, grid, players, damage, dt);
+
+  return { playerDamage: damage, destroyedBarrels, shockwaves };
+}
+
+/**
+ * One frame of every live shockwave ring: grow the perimeter, then resolve each
+ * living player the swept band touches — exactly once per ring.
+ *
+ * A victim takes the flat shockwave damage and is cursed *only* when the boss
+ * has a clear line-of-sight ray to them: behind a wooden crate or wall the ray
+ * is blocked, so the wave is occluded and the player is spared. Cover works.
+ *
+ * The impact damage always lands; the curse is additionally gated by the shared
+ * strict guards (solo immunity, one curse at a time, respawn / revive window).
+ */
+function stepShockwaves(
+  horde: Horde,
+  grid: GridMap,
+  players: readonly Player[],
+  damage: number[],
+  dt: number
+): void {
+  // Guards that hold for the whole frame: solo runs never curse, and while any
+  // player is down (respawn timer or active revive) nobody may be cursed.
+  const anyPlayerDowned = players.some((player) => !player.alive || player.reviveHold > 0);
+  const holder = players.find((player) => player.cursed && player.alive);
+  let activeCursedId = holder ? String(holder.index) : '';
+
+  for (let i = horde.shockwaves.length - 1; i >= 0; i--) {
+    const ring = horde.shockwaves[i];
+    const { prevRadius } = advanceShockwaveRing(ring, dt);
+    for (const player of players) {
+      if (!player.alive || ring.resolved.has(player.index)) continue;
+      if (
+        !ringSweepHitsCircle(
+          ring.x,
+          ring.z,
+          prevRadius,
+          ring.radius,
+          ring.halfThickness,
+          player.x,
+          player.z,
+          PLAYER_CONFIG.radius
+        )
+      ) {
+        continue;
+      }
+      ring.resolved.add(player.index);
+      if (!grid.lineOfSight(ring.x, ring.z, player.x, player.z)) continue;
+      damage[player.index] += BLACK_DEVIL.shockwaveDamage;
+      // The wave landed: curse the victim only when the strict guards allow it.
+      if (!player.curse && !player.cursed) {
+        if (
+          canApplyCurse({
+            playerCount: players.length,
+            activeCursedId,
+            targetId: String(player.index),
+            targetAlive: player.alive,
+            anyPlayerDowned,
+          })
+        ) {
+          player.curse = createCurseState();
+          player.cursed = true;
+          activeCursedId = String(player.index);
+        }
+      }
+    }
+    if (ring.radius >= ring.maxRadius) horde.shockwaves.splice(i, 1);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +874,16 @@ export function createDirector(): Director {
 }
 
 function buildQueue(wave: number, event: WaveEventKind): ZombieKind[] {
-  const count = Math.min(DIRECTOR_CONFIG.maxCount, DIRECTOR_CONFIG.baseCount + DIRECTOR_CONFIG.perWaveCount * wave);
+  // Wave-7 boss encounter: the standard horde is halved (−50% small mobs) so
+  // players can focus the Black Devil, and no extra red Devils join it.
+  const bossWave = wave === DIRECTOR_CONFIG.blackDevilWave;
+  const mobMultiplier = bossWave ? DIRECTOR_CONFIG.blackDevilMobCountMultiplier : 1;
+  const count = Math.round(
+    Math.min(
+      DIRECTOR_CONFIG.maxCount,
+      DIRECTOR_CONFIG.baseCount + DIRECTOR_CONFIG.perWaveCount * wave
+    ) * mobMultiplier
+  );
   const queue: ZombieKind[] = [];
 
   // Speed Horde: exclusively lightweight runners (spawn applies the +80% bonus).
@@ -619,6 +895,11 @@ function buildQueue(wave: number, event: WaveEventKind): ZombieKind[] {
   for (let i = 0; i < count; i++) {
     const runner = wave >= DIRECTOR_CONFIG.runnerFromWave && i % 3 === 2;
     queue.push(runner ? 'runner' : 'walker');
+  }
+  if (bossWave) {
+    // The boss spawns first, at the very start of the wave.
+    queue.unshift('blackDevil');
+    return queue;
   }
   // devils join from their configured wave, growing slowly
   if (wave >= DIRECTOR_CONFIG.devilFromWave) {

@@ -14,7 +14,7 @@
 import * as THREE from 'three';
 
 import type { GridMap } from '../../../shared/src/grid.ts';
-import { buildFireballMesh } from '../game/actors.ts';
+import { buildFireballMesh, buildSpinnerMesh } from '../game/actors.ts';
 import { placeBarricade, removeBarricade } from '../game/barricades.ts';
 import type { Barricade } from '../game/barricades.ts';
 import { PICKUP_RADIUS, spawnPickup } from '../game/pickups.ts';
@@ -57,7 +57,9 @@ export class OnlineWorld {
   /** Drop ids we already asked the room for (so we don't spam the message). */
   private readonly requested = new Set<number>();
   private readonly hazardMeshes: THREE.Mesh[] = [];
-  private readonly fireballMeshes: THREE.Mesh[] = [];
+  /** One render slot per server projectile; `kind` is tracked so a pooled slot
+   * is rebuilt when a fireball index is reused by a spinner (or vice versa). */
+  private readonly fireballMeshes: { mesh: THREE.Object3D; kind: 'fireball' | 'spinner' }[] = [];
 
   /** Tears every mirrored entity down (match start / end / leaving the room). */
   reset(ctx: OnlineWorldContext): void {
@@ -86,7 +88,7 @@ export class OnlineWorld {
       (mesh.material as THREE.Material).dispose(); // per-instance tint material
     }
     this.hazardMeshes.length = 0;
-    for (const mesh of this.fireballMeshes) ctx.scene.remove(mesh);
+    for (const slot of this.fireballMeshes) ctx.scene.remove(slot.mesh);
     this.fireballMeshes.length = 0;
   }
 
@@ -109,8 +111,9 @@ export class OnlineWorld {
       seen.add(enemy.id);
       let proxy = this.enemyProxies.get(enemy.id);
       if (!proxy) {
+        // spawnZombie applies each kind's own rendered scale (red Devil 1.15,
+        // Black Devil ~1.5× larger).
         proxy = spawnZombie(ctx.horde, ctx.scene, enemy.kind, enemy.x, enemy.z);
-        if (enemy.kind === 'devil') proxy.mesh.scale.setScalar(1.15);
         this.enemyProxies.set(enemy.id, proxy);
         this.idByProxy.set(proxy, enemy.id);
         this.enemyTargets.set(enemy.id, { x: enemy.x, z: enemy.z });
@@ -118,6 +121,15 @@ export class OnlineWorld {
       proxy.hp = enemy.hp;
       proxy.maxHp = enemy.maxHp;
       this.applyDevilRage(proxy, enemy.phase2);
+      // Black Devil: mirror the server's synchronized attack state so both
+      // clients paint the same telegraph / beam from the same tick.
+      proxy.attackState = enemy.attack === 1 ? 'charge' : enemy.attack === 2 ? 'fire' : 'idle';
+      proxy.laserDirX = enemy.laserX;
+      proxy.laserDirZ = enemy.laserZ;
+      // Server-clamped beam reach: the render stops at the obstacle the raycast
+      // hit, so the purple laser can never pass through a wall / crate.
+      proxy.laserLength = enemy.laserLength;
+      proxy.attackTimer = enemy.attackTimer;
       const target = this.enemyTargets.get(enemy.id);
       if (target) {
         target.x = enemy.x;
@@ -228,18 +240,22 @@ export class OnlineWorld {
 
   private syncFireballs(ctx: OnlineWorldContext, info: RoomInfo): void {
     while (this.fireballMeshes.length > info.fireballs.length) {
-      const mesh = this.fireballMeshes.pop() as THREE.Mesh;
-      ctx.scene.remove(mesh);
+      const slot = this.fireballMeshes.pop() as { mesh: THREE.Object3D; kind: 'fireball' | 'spinner' };
+      ctx.scene.remove(slot.mesh);
     }
     for (let i = 0; i < info.fireballs.length; i++) {
       const ball = info.fireballs[i];
-      let mesh = this.fireballMeshes[i];
-      if (!mesh) {
-        mesh = buildFireballMesh();
+      let slot = this.fireballMeshes[i];
+      if (!slot || slot.kind !== ball.kind) {
+        if (slot) ctx.scene.remove(slot.mesh);
+        const mesh = ball.kind === 'spinner' ? buildSpinnerMesh() : buildFireballMesh();
         ctx.scene.add(mesh);
-        this.fireballMeshes[i] = mesh;
+        slot = { mesh, kind: ball.kind };
+        this.fireballMeshes[i] = slot;
       }
-      mesh.position.set(ball.x, 1.0, ball.z);
+      slot.mesh.position.set(ball.x, 1.0, ball.z);
+      // Spinners whirl at the server-synchronized orbit phase.
+      if (ball.kind === 'spinner') slot.mesh.rotation.y = ball.spin;
     }
   }
 

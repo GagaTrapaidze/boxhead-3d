@@ -30,7 +30,21 @@ import {
 import { waveEventFor } from '../../../shared/src/waveEvents.ts';
 import type { WaveEventKind } from '../../../shared/src/waveEvents.ts';
 import { getWeapon } from '../../../shared/src/weapons.ts';
-import { rollDropKind } from '../../../shared/src/loot.ts';
+import {
+  advanceShockwaveRing,
+  createShockwaveRing,
+  ringSweepHitsCircle,
+} from '../../../shared/src/shockwave.ts';
+import type { ShockwaveRing } from '../../../shared/src/shockwave.ts';
+import {
+  advanceCurse,
+  canApplyCurse,
+  createCurseState,
+  curseProgress,
+  isInCurseCircle,
+} from '../../../shared/src/curse.ts';
+import type { CurseState } from '../../../shared/src/curse.ts';
+import { bossLootCount, pickBossLoot, rollDropKind } from '../../../shared/src/loot.ts';
 import type { DropKind, EnemyKind, PropKind } from '../../../shared/src/loot.ts';
 
 const ATTACK_RANGE = ENEMY_CONFIG.attackRange;
@@ -40,6 +54,8 @@ const DEVIL_FIRE_INTERVAL = ENEMY_CONFIG.devilFireInterval;
 const DEVIL_FIRE_RANGE_MIN = ENEMY_CONFIG.devilFireRangeMin;
 const DEVIL_FIRE_RANGE_MAX = ENEMY_CONFIG.devilFireRangeMax;
 const SUPPRESS_DURATION = ENEMY_CONFIG.suppressDuration;
+/** Wave-7 boss tuning (single source: shared/src/balance.config.ts). */
+const BLACK_DEVIL = ENEMY_CONFIG.blackDevil;
 /** Damage a mob deals to a barricade it is clawing through (every 0.5 s). */
 const BARRICADE_MELEE_DAMAGE = 25;
 /** Explosive-barrel durability (mirrors the client's BARRICADE_HP). */
@@ -78,6 +94,32 @@ export interface SimEnemy {
   dashDirX: number;
   dashDirZ: number;
   hazTimer: number;
+  /**
+   * Black Devil only: 'idle' | 'charge' (1 s laser telegraph) | 'fire' (3.5 s
+   * beam channel). While charging or firing the boss stands still and every
+   * other attack is disabled.
+   */
+  attackState: 'idle' | 'charge' | 'fire';
+  /** Countdown within the active laser phase (telegraph or channel). */
+  attackTimer: number;
+  /** Seconds until the next laser telegraph is allowed. */
+  laserCooldown: number;
+  /** Beam aim direction (unit vector), ramped with rotational inertia. */
+  laserDirX: number;
+  laserDirZ: number;
+  /** sessionId the current beam is locked onto ("" when idle). */
+  laserTarget: string;
+  /** Countdown to the next beam damage tick. */
+  laserTick: number;
+  /**
+   * Distance the beam actually reaches, clamped to the first wall / crate the
+   * ray meets (grid raycast). Clients draw the telegraph and beam only this far
+   * so the laser never renders through an obstacle, and beam damage is limited
+   * to victims in front of that hit point.
+   */
+  laserLength: number;
+  /** Seconds until the next radial shockwave is allowed (strict 4.5 s). */
+  shockCooldown: number;
   /** sessionId of the nearest alive player this tick ("" when none). */
   target: string;
 }
@@ -93,12 +135,31 @@ export interface SimHazard {
   tick: number;
 }
 
+/**
+ * A live expanding shockwave: an annulus that races outward from the boss
+ * origin. It is a real physical entity (not an instant radius check) that
+ * sweeps the perimeter across players' bodies over several ticks, is occluded
+ * by walls / crates, and curses whoever it lands on.
+ */
+export interface SimShockwave extends ShockwaveRing {
+  id: number;
+  /** Player ids already resolved (damaged, occluded or cleared by cover). */
+  readonly resolved: Set<string>;
+}
+
+/** Per-player curse runtime kept by the simulation (id = sessionId). */
+export interface SimCurse extends CurseState {}
+
 export interface SimFireball {
   id: number;
+  /** 'fireball' = red Devil homing orb; 'spinner' = black Devil's orbiting cubes. */
+  kind: 'fireball' | 'spinner';
   x: number;
   z: number;
   dirX: number;
   dirZ: number;
+  /** Orbit phase of a spinner's cubes, in radians (synchronized to clients). */
+  spin: number;
   life: number;
 }
 
@@ -125,6 +186,7 @@ export type SimEvent =
   | { type: 'enemyKilled'; id: number; kind: EnemyKind; x: number; z: number; killer: string }
   | { type: 'propDestroyed'; kind: PropKind; cx: number; cz: number }
   | { type: 'explosion'; x: number; z: number; radius: number }
+  | { type: 'shockwave'; x: number; z: number; radius: number; speed: number }
   | { type: 'waveStart'; wave: number; event: WaveEventKind }
   | { type: 'waveClear'; wave: number };
 
@@ -135,6 +197,10 @@ export class WorldSim {
   readonly fireballs: SimFireball[] = [];
   readonly props: SimProp[] = [];
   readonly drops: SimDrop[] = [];
+  /** Live expanding shockwave rings (Attack 2). */
+  readonly shockwaves: SimShockwave[] = [];
+  /** Active curse debuffs, keyed by player sessionId. */
+  private readonly curses = new Map<string, SimCurse>();
 
   wave = 0;
   event: WaveEventKind = 'none';
@@ -150,6 +216,7 @@ export class WorldSim {
   private nextHazardId = 1;
   private nextFireballId = 1;
   private nextDropId = 1;
+  private nextShockwaveId = 1;
   private spawnPoints: { x: number; z: number }[] = [];
   /** Staggered barrel chain fuses (`chainFuseDelay` per link). */
   private chainFuses: { cx: number; cz: number; timer: number }[] = [];
@@ -187,6 +254,8 @@ export class WorldSim {
     this.fireballs.length = 0;
     this.props.length = 0;
     this.drops.length = 0;
+    this.shockwaves.length = 0;
+    this.curses.clear();
     this.chainFuses = [];
     this.field = null;
     this.fieldTimer = 0;
@@ -203,6 +272,31 @@ export class WorldSim {
   /** Copies the authoritative player transforms in before each step. */
   syncPlayers(players: SimPlayer[]): void {
     this.players = players;
+    // Drop curse state for anyone who left the room so the map never leaks.
+    if (this.curses.size > 0) {
+      const live = new Set(players.map((player) => player.id));
+      for (const id of [...this.curses.keys()]) {
+        if (!live.has(id)) this.curses.delete(id);
+      }
+    }
+  }
+
+  // --- curse queries (the room mirrors these into its schema) ---------------
+
+  /** True while this player is cursed (ticking damage until cleansed). */
+  isCursed(id: string): boolean {
+    return this.curses.has(id);
+  }
+
+  /** Normalized cleanse hold (0..1) for a cursed player (0 when not cursed). */
+  curseProgressOf(id: string): number {
+    const curse = this.curses.get(id);
+    return curse ? curseProgress(curse) : 0;
+  }
+
+  /** Clears a player's curse immediately (death / respawn / match reset). */
+  clearCurse(id: string): void {
+    this.curses.delete(id);
   }
 
   // --- queries -------------------------------------------------------------
@@ -263,6 +357,21 @@ export class WorldSim {
       z: enemy.z,
       killer,
     });
+    // The Black Devil dies in a "loot explosion": 3–4 reward cubes (health
+    // packs, special ammo / barrels) scattered around its footprint.
+    if (enemy.kind === 'blackDevil') {
+      const count = bossLootCount();
+      for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const distance = 0.4 + Math.random() * 1.1;
+        this.spawnDrop(
+          pickBossLoot(),
+          enemy.x + Math.cos(angle) * distance,
+          enemy.z + Math.sin(angle) * distance
+        );
+      }
+      return;
+    }
     const drop = rollDropKind();
     if (drop) this.spawnDrop(drop, enemy.x, enemy.z);
   }
@@ -342,6 +451,7 @@ export class WorldSim {
         1 - PHYSICS_CONFIG.explosionFalloff * Math.min(1, distance / Math.max(0.01, radius));
       let amount = damage * falloff;
       if (enemy.kind === 'devil') amount = Math.min(amount, ENEMY_CONFIG.devil.explosiveDamageCap);
+      else if (enemy.kind === 'blackDevil') amount = Math.min(amount, BLACK_DEVIL.explosiveDamageCap);
       victims.push({ enemy, amount });
     }
     for (const { enemy, amount } of victims) {
@@ -394,8 +504,10 @@ export class WorldSim {
   step(dt: number): void {
     this.updateDirector(dt);
     this.updateHorde(dt);
+    this.updateShockwaves(dt);
     this.updateHazards(dt);
     this.updateFireballs(dt);
+    this.updateCurses(dt);
     this.updateChainFuses(dt);
     this.updateDrops(dt);
   }
@@ -438,9 +550,15 @@ export class WorldSim {
   }
 
   private buildQueue(): void {
-    const count = Math.min(
-      DIRECTOR_CONFIG.maxCount,
-      DIRECTOR_CONFIG.baseCount + DIRECTOR_CONFIG.perWaveCount * this.wave
+    // Wave-7 boss encounter: the standard horde is halved (−50% small mobs) so
+    // players can focus the Black Devil, and no extra red Devils join it.
+    const bossWave = this.wave === DIRECTOR_CONFIG.blackDevilWave;
+    const mobMultiplier = bossWave ? DIRECTOR_CONFIG.blackDevilMobCountMultiplier : 1;
+    const count = Math.round(
+      Math.min(
+        DIRECTOR_CONFIG.maxCount,
+        DIRECTOR_CONFIG.baseCount + DIRECTOR_CONFIG.perWaveCount * this.wave
+      ) * mobMultiplier
     );
     // Speed Horde: exclusively lightweight runners (spawn applies the +80% bonus).
     if (this.event === 'speedHorde') {
@@ -450,6 +568,11 @@ export class WorldSim {
     for (let i = 0; i < count; i++) {
       const runner = this.wave >= DIRECTOR_CONFIG.runnerFromWave && i % 3 === 2;
       this.queue.push(runner ? 'runner' : 'walker');
+    }
+    if (bossWave) {
+      // The boss spawns first, at the very start of the wave.
+      this.queue.unshift('blackDevil');
+      return;
     }
     if (this.wave >= DIRECTOR_CONFIG.devilFromWave) {
       const devils = Math.min(DIRECTOR_CONFIG.maxDevils, 1 + Math.floor(this.wave / 4));
@@ -483,6 +606,15 @@ export class WorldSim {
       dashDirX: 0,
       dashDirZ: -1,
       hazTimer: 0,
+      attackState: 'idle',
+      attackTimer: 0,
+      laserCooldown: BLACK_DEVIL.laserCooldown * (0.5 + Math.random() * 0.5),
+      laserDirX: 0,
+      laserDirZ: -1,
+      laserTarget: '',
+      laserTick: 0,
+      laserLength: BLACK_DEVIL.laserRange,
+      shockCooldown: 0,
       target: '',
     };
     // Speed Horde: every runner gets its +80% movement bonus (HP stays at 40).
@@ -527,6 +659,160 @@ export class WorldSim {
     return best;
   }
 
+  /** A specific living player by sessionId (the laser's locked target). */
+  private playerById(id: string): SimPlayer | null {
+    if (!id) return null;
+    const player = this.players.find((candidate) => candidate.id === id);
+    return player && player.alive ? player : null;
+  }
+
+  /**
+   * Attack 2 — radial shockwave (close-range defense).
+   *
+   * Spawns a *physical* expanding ring at the boss instead of applying instant
+   * radius damage: the ring's perimeter races outward over the following ticks
+   * and only wounds a player when it actually sweeps their body (see
+   * {@link updateShockwaves}). The one-shot event tells every client to play the
+   * same expanding ring + screen shake.
+   */
+  private shockwave(enemy: SimEnemy): void {
+    const ring: SimShockwave = {
+      ...createShockwaveRing(
+        enemy.x,
+        enemy.z,
+        BLACK_DEVIL.shockwaveRadius,
+        BLACK_DEVIL.shockwaveRingThickness,
+        BLACK_DEVIL.shockwaveExpansionSpeed
+      ),
+      id: this.nextShockwaveId++,
+      resolved: new Set<string>(),
+    };
+    this.shockwaves.push(ring);
+    this.events.push({
+      type: 'shockwave',
+      x: ring.x,
+      z: ring.z,
+      radius: ring.maxRadius,
+      speed: ring.speed,
+    });
+  }
+
+  /**
+   * One tick of every live shockwave: expand the ring, then resolve each living
+   * player the swept perimeter touches.
+   *
+   * A player is resolved at most once per ring (their id joins `resolved`):
+   * they take the flat shockwave damage and gain a curse *only* when the boss
+   * has a clear line-of-sight ray to them. Behind a wooden crate or wall the
+   * ray is blocked, so the wave is occluded and the player is spared entirely
+   * — cover genuinely blocks the shockwave.
+   *
+   * The flat impact damage always lands; the curse is additionally gated by the
+   * strict {@link canApplyCurse} rules (solo immunity, one curse at a time and
+   * the respawn / revive immunity window) evaluated in {@link applyCurse}.
+   */
+  private updateShockwaves(dt: number): void {
+    for (let i = this.shockwaves.length - 1; i >= 0; i--) {
+      const ring = this.shockwaves[i];
+      const { prevRadius } = advanceShockwaveRing(ring, dt);
+
+      for (const player of this.players) {
+        if (!player.alive || ring.resolved.has(player.id)) continue;
+        if (
+          !ringSweepHitsCircle(
+            ring.x,
+            ring.z,
+            prevRadius,
+            ring.radius,
+            ring.halfThickness,
+            player.x,
+            player.z,
+            PLAYER_CONFIG.radius
+          )
+        ) {
+          continue;
+        }
+        // The perimeter reached this body: mark it done either way so cover
+        // persists for the rest of the wave.
+        ring.resolved.add(player.id);
+        if (!this.grid.lineOfSight(ring.x, ring.z, player.x, player.z)) continue;
+        this.playerDamage.set(
+          player.id,
+          (this.playerDamage.get(player.id) ?? 0) + BLACK_DEVIL.shockwaveDamage
+        );
+        this.applyCurse(player.id);
+      }
+
+      if (ring.radius >= ring.maxRadius) this.shockwaves.splice(i, 1);
+    }
+  }
+
+  /**
+   * Flags a player as cursed (fresh tick/cleanse clocks if not already) — but
+   * only when all three strict guards allow it. A failed guard is silent: the
+   * shockwave still dealt its flat impact damage, only the debuff is withheld.
+   */
+  private applyCurse(playerId: string): void {
+    if (this.curses.has(playerId)) return; // already cursed: keep its clocks
+    if (!this.curseAllowed(playerId)) return;
+    this.curses.set(playerId, createCurseState());
+  }
+
+  /**
+   * The sessionId of the player currently holding the single active curse (''
+   * when none). Only a *living* holder counts: a curse whose victim has died
+   * frees the slot immediately, exactly as if it had been cleansed.
+   */
+  private activeCurseHolder(): string {
+    for (const id of this.curses.keys()) {
+      const holder = this.players.find((player) => player.id === id);
+      if (holder && holder.alive) return id;
+    }
+    return '';
+  }
+
+  /** Evaluates the shared curse guards against the live match state. */
+  private curseAllowed(playerId: string): boolean {
+    return canApplyCurse({
+      playerCount: this.players.length,
+      activeCursedId: this.activeCurseHolder(),
+      targetId: playerId,
+      targetAlive: this.players.some((player) => player.id === playerId && player.alive),
+      // In co-op a downed player is either on the respawn timer or being
+      // actively revived; either way the whole match is curse-immune.
+      anyPlayerDowned: this.players.some((player) => !player.alive),
+    });
+  }
+
+  /**
+   * One tick of every active curse: bleed `curseDamage` on the fixed interval
+   * and let a *teammate* standing inside the cleansing circle chip away at the
+   * 3 s hold. The hold resets the moment that teammate steps out, and a curse
+   * is dropped entirely when its victim goes down or a teammate finishes the
+   * cleanse.
+   */
+  private updateCurses(dt: number): void {
+    if (this.curses.size === 0) return;
+    for (const [id, curse] of [...this.curses]) {
+      const cursed = this.players.find((player) => player.id === id);
+      if (!cursed || !cursed.alive) {
+        this.curses.delete(id);
+        continue;
+      }
+      const cleansed = this.players.some(
+        (teammate) =>
+          teammate.id !== id &&
+          teammate.alive &&
+          isInCurseCircle(cursed.x, cursed.z, teammate.x, teammate.z)
+      );
+      const step = advanceCurse(curse, dt, cleansed);
+      if (step.damage > 0) {
+        this.playerDamage.set(id, (this.playerDamage.get(id) ?? 0) + step.damage);
+      }
+      if (step.cleansed) this.curses.delete(id);
+    }
+  }
+
   /** Recomputes the shared flow field toward every living player (4 Hz). */
   private refreshField(dt: number): void {
     this.fieldTimer -= dt;
@@ -569,7 +855,142 @@ export class WorldSim {
       let frozen = false;
       let speedScale = 1;
 
-      if (enemy.kind === 'devil') {
+      if (enemy.kind === 'blackDevil') {
+        enemy.dir = Math.atan2(toTargetX, toTargetZ);
+
+        if (enemy.attackState === 'charge') {
+          // Attack 3, telegraph phase: stand still and paint an aim line locked
+          // onto the chosen player (1 s). Every other attack is disabled.
+          frozen = true;
+          enemy.attackTimer -= dt;
+          const locked = this.playerById(enemy.laserTarget) ?? target;
+          const ldx = locked.x - enemy.x;
+          const ldz = locked.z - enemy.z;
+          const len = Math.hypot(ldx, ldz) || 1;
+          enemy.laserDirX = ldx / len;
+          enemy.laserDirZ = ldz / len;
+          // Continuous raycast: the aim line stops at the first wall / crate it
+          // meets, so the telegraph never paints through cover.
+          enemy.laserLength = this.grid.raycastDistance(
+            enemy.x,
+            enemy.z,
+            enemy.laserDirX,
+            enemy.laserDirZ,
+            BLACK_DEVIL.laserRange
+          );
+          if (enemy.attackTimer <= 0) {
+            enemy.attackState = 'fire';
+            enemy.attackTimer = BLACK_DEVIL.laserDuration;
+            enemy.laserTick = 0;
+          }
+        } else if (enemy.attackState === 'fire') {
+          // Attack 3, beam phase: hold still, track the locked player with
+          // rotational inertia (sprint/strafe dodges it) and tick damage.
+          frozen = true;
+          enemy.attackTimer -= dt;
+          const locked = this.playerById(enemy.laserTarget) ?? target;
+          const desired = Math.atan2(locked.x - enemy.x, locked.z - enemy.z);
+          let delta = desired - Math.atan2(enemy.laserDirX, enemy.laserDirZ);
+          while (delta > Math.PI) delta -= Math.PI * 2;
+          while (delta < -Math.PI) delta += Math.PI * 2;
+          const maxTurn = BLACK_DEVIL.laserTurnRate * dt;
+          const angle = Math.atan2(enemy.laserDirX, enemy.laserDirZ) + Math.max(-maxTurn, Math.min(maxTurn, delta));
+          enemy.laserDirX = Math.sin(angle);
+          enemy.laserDirZ = Math.cos(angle);
+          // Re-clamp the beam every tick: as the boss tracks, the beam length
+          // follows whatever obstacle now blocks the ray from its origin.
+          enemy.laserLength = this.grid.raycastDistance(
+            enemy.x,
+            enemy.z,
+            enemy.laserDirX,
+            enemy.laserDirZ,
+            BLACK_DEVIL.laserRange
+          );
+          enemy.laserTick -= dt;
+          if (enemy.laserTick <= 0) {
+            enemy.laserTick = BLACK_DEVIL.laserTickInterval;
+            for (const player of this.players) {
+              if (!player.alive) continue;
+              const ox = player.x - enemy.x;
+              const oz = player.z - enemy.z;
+              const along = ox * enemy.laserDirX + oz * enemy.laserDirZ;
+              // Only victims in front of the wall the beam stops at are exposed.
+              if (along < 0 || along > enemy.laserLength) continue;
+              const perpendicular = Math.abs(ox * enemy.laserDirZ - oz * enemy.laserDirX);
+              if (perpendicular > BLACK_DEVIL.laserHalfWidth + PLAYER_CONFIG.radius) continue;
+              if (!this.grid.lineOfSight(enemy.x, enemy.z, player.x, player.z)) continue;
+              this.playerDamage.set(
+                player.id,
+                (this.playerDamage.get(player.id) ?? 0) + BLACK_DEVIL.laserDamage
+              );
+            }
+          }
+          if (enemy.attackTimer <= 0) {
+            enemy.attackState = 'idle';
+            enemy.attackTimer = 0;
+            enemy.laserCooldown = BLACK_DEVIL.laserCooldown;
+            enemy.laserDirX = 0;
+            enemy.laserDirZ = 0;
+          }
+        } else {
+          // Idle: hold the ranged band, defend with the shockwave and pick
+          // between the laser wind-up and a spinner volley.
+          if (distanceToTarget > BLACK_DEVIL.spinnerRangeMax) {
+            dirX = toTargetX * invDistance;
+            dirZ = toTargetZ * invDistance;
+          } else if (distanceToTarget < BLACK_DEVIL.spinnerRangeMin) {
+            dirX = -toTargetX * invDistance;
+            dirZ = -toTargetZ * invDistance;
+          }
+          if (enemy.shockCooldown > 0) enemy.shockCooldown -= dt;
+          if (enemy.laserCooldown > 0) enemy.laserCooldown -= dt;
+          enemy.fireCooldown -= dt;
+
+          const crowded = this.players.some(
+            (player) =>
+              player.alive &&
+              Math.hypot(player.x - enemy.x, player.z - enemy.z) <= BLACK_DEVIL.shockwaveTriggerRange
+          );
+          if (crowded && enemy.shockCooldown <= 0) {
+            this.shockwave(enemy);
+            enemy.shockCooldown = BLACK_DEVIL.shockwaveCooldown;
+          }
+
+          const hasSight = this.grid.lineOfSight(enemy.x, enemy.z, target.x, target.z);
+          if (enemy.laserCooldown <= 0 && distanceToTarget <= BLACK_DEVIL.laserRange && hasSight) {
+            enemy.attackState = 'charge';
+            enemy.attackTimer = BLACK_DEVIL.laserTelegraph;
+            enemy.laserTarget = target.id;
+            const len = Math.max(distanceToTarget, 1e-6);
+            enemy.laserDirX = toTargetX / len;
+            enemy.laserDirZ = toTargetZ / len;
+            enemy.laserLength = this.grid.raycastDistance(
+              enemy.x,
+              enemy.z,
+              enemy.laserDirX,
+              enemy.laserDirZ,
+              BLACK_DEVIL.laserRange
+            );
+          } else if (
+            enemy.fireCooldown <= 0 &&
+            distanceToTarget <= BLACK_DEVIL.spinnerRangeMax &&
+            hasSight
+          ) {
+            // Attack 1 — spinning fireball: 4 orbiting cubes aimed at the target.
+            this.fireballs.push({
+              id: this.nextFireballId++,
+              kind: 'spinner',
+              x: enemy.x,
+              z: enemy.z,
+              dirX: toTargetX * invDistance,
+              dirZ: toTargetZ * invDistance,
+              spin: 0,
+              life: BLACK_DEVIL.spinnerLife,
+            });
+            enemy.fireCooldown = BLACK_DEVIL.spinnerInterval;
+          }
+        }
+      } else if (enemy.kind === 'devil') {
         if (!enemy.phase2 && enemy.hp <= enemy.maxHp * ENEMY_CONFIG.devilPhase2HpFraction) {
           enemy.phase2 = true;
         }
@@ -615,10 +1036,12 @@ export class WorldSim {
           ) {
             this.fireballs.push({
               id: this.nextFireballId++,
+              kind: 'fireball',
               x: enemy.x,
               z: enemy.z,
               dirX: toTargetX * invDistance,
               dirZ: toTargetZ * invDistance,
+              spin: 0,
               life: ENEMY_CONFIG.fireballLife,
             });
             enemy.fireCooldown = DEVIL_FIRE_INTERVAL;
@@ -770,11 +1193,18 @@ export class WorldSim {
   private updateFireballs(dt: number): void {
     for (let i = this.fireballs.length - 1; i >= 0; i--) {
       const ball = this.fireballs[i];
+      const spinner = ball.kind === 'spinner';
+      const speed = spinner ? BLACK_DEVIL.spinnerSpeed : ENEMY_CONFIG.fireballSpeed;
+      // Spinners barely steer (they are aimed at fire time and dodgeable).
+      const turnRate = spinner ? BLACK_DEVIL.spinnerTurnRate : ENEMY_CONFIG.fireballTurnRate;
+      const damage = spinner ? BLACK_DEVIL.spinnerDamage : ENEMY_CONFIG.fireballDamage;
       ball.life -= dt;
       if (ball.life <= 0) {
         this.fireballs.splice(i, 1);
         continue;
       }
+      if (spinner) ball.spin += BLACK_DEVIL.spinnerSpinRate * dt;
+
       // gentle homing toward the nearest player
       const target = this.nearestPlayer(ball.x, ball.z);
       if (target) {
@@ -782,7 +1212,7 @@ export class WorldSim {
         const toZ = target.z - ball.z;
         const length = Math.hypot(toX, toZ);
         if (length > 1e-6) {
-          const turn = Math.min(1, ENEMY_CONFIG.fireballTurnRate * dt);
+          const turn = Math.min(1, turnRate * dt);
           ball.dirX += (toX / length - ball.dirX) * turn;
           ball.dirZ += (toZ / length - ball.dirZ) * turn;
           const norm = Math.hypot(ball.dirX, ball.dirZ) || 1;
@@ -790,8 +1220,8 @@ export class WorldSim {
           ball.dirZ /= norm;
         }
       }
-      ball.x += ball.dirX * ENEMY_CONFIG.fireballSpeed * dt;
-      ball.z += ball.dirZ * ENEMY_CONFIG.fireballSpeed * dt;
+      ball.x += ball.dirX * speed * dt;
+      ball.z += ball.dirZ * speed * dt;
 
       if (this.grid.isBlockedWorld(ball.x, ball.z)) {
         this.fireballs.splice(i, 1);
@@ -801,10 +1231,7 @@ export class WorldSim {
       for (const player of this.players) {
         if (!player.alive) continue;
         if (Math.hypot(player.x - ball.x, player.z - ball.z) <= PLAYER_CONFIG.radius + 0.45) {
-          this.playerDamage.set(
-            player.id,
-            (this.playerDamage.get(player.id) ?? 0) + ENEMY_CONFIG.fireballDamage
-          );
+          this.playerDamage.set(player.id, (this.playerDamage.get(player.id) ?? 0) + damage);
           hit = true;
           break;
         }

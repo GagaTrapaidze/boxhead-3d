@@ -423,6 +423,8 @@ export interface DropBalance {
   pickupBlinkInterval: number;
   /** Walk-over collection radius. */
   pickupRadius: number;
+  /** HP restored by a health-pack drop (boss loot). */
+  healthRestore: number;
 }
 
 /** Base drop chance before the global frequency multiplier (35% drop rate). */
@@ -460,6 +462,7 @@ export const DROP_CONFIG: DropBalance = {
   /** ~6.7 blinks/second during the warning window. */
   pickupBlinkInterval: 0.15,
   pickupRadius: 0.9,
+  healthRestore: 50,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -488,6 +491,8 @@ export interface WaveBalance {
   pickupBlinkInterval: number;
   /** Walk-over collection radius. */
   pickupRadius: number;
+  /** HP restored by a health-pack drop (boss loot). */
+  healthRestore: number;
 }
 
 /** The −30% drop-frequency knob, re-exported for tests and engine imports.
@@ -507,6 +512,7 @@ export const WAVE_CONFIG: WaveBalance = {
   pickupWarningSeconds: DROP_CONFIG.pickupWarningSeconds,
   pickupBlinkInterval: DROP_CONFIG.pickupBlinkInterval,
   pickupRadius: DROP_CONFIG.pickupRadius,
+  healthRestore: DROP_CONFIG.healthRestore,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -581,10 +587,85 @@ export interface DevilBalance extends ZombieBalance {
   explosiveDamageCap: number;
 }
 
+export interface BlackDevilBalance extends DevilBalance {
+  /** Attack 1 — spinning fireball: 4 orbiting cubes fired at range. */
+  spinnerSpeed: number;
+  spinnerLife: number;
+  spinnerDamage: number;
+  /** Seconds between spinner volleys. */
+  spinnerInterval: number;
+  /** How sharply a spinner steers after launch, in radians/second (low = dodgeable). */
+  spinnerTurnRate: number;
+  /** Distance band the boss holds while in its ranged stance. */
+  spinnerRangeMin: number;
+  spinnerRangeMax: number;
+  /** Orbit spin rate of the 4 cubes (radians/second). */
+  spinnerSpinRate: number;
+  /** Attack 2 — radial shockwave (close-range defense). */
+  /** Outer radius (world units) the expanding ring grows to before it fades. */
+  shockwaveRadius: number;
+  /** Flat damage dealt to every player the ring's perimeter actually touches. */
+  shockwaveDamage: number;
+  /** Strict internal cooldown between shockwaves, in seconds. */
+  shockwaveCooldown: number;
+  /** A player closer than this triggers a shockwave (when off cooldown). */
+  shockwaveTriggerRange: number;
+  /** World units/second the ring perimeter expands outward (see
+   * `SHOCKWAVE_EXPANSION_SPEED`, the single tuning knob for this). */
+  shockwaveExpansionSpeed: number;
+  /** Half-thickness of the expanding ring's damage band, in world units. The
+   * perimeter must physically sweep a victim's body to connect, so this sets
+   * how forgiving that contact test is (a small band = a thin wave). */
+  shockwaveRingThickness: number;
+  /**
+   * Curse (co-op) — a player the shockwave lands on takes ticking damage until
+   * a teammate stands in the cleansing circle for `curseCleanseSeconds`.
+   */
+  /** HP lost on every curse damage tick. */
+  curseDamage: number;
+  /** Seconds between curse damage ticks. */
+  curseTickInterval: number;
+  /** Radius (world units / platform blocks) of the cleansing circle. */
+  curseRadius: number;
+  /** Seconds a teammate must hold inside the circle to lift the curse. */
+  curseCleanseSeconds: number;
+  /** Attack 3 — telegraphed purple tracking laser. */
+  /** Telegraph wind-up: the boss stands still and paints a thin aim line. */
+  laserTelegraph: number;
+  /** Channel duration of the thick beam. */
+  laserDuration: number;
+  /** Seconds after the beam ends before the next telegraph. */
+  laserCooldown: number;
+  laserRange: number;
+  /** Half-width of the beam's damage volume (world units). */
+  laserHalfWidth: number;
+  /** How fast the beam tracks its target, in radians/second (inertia). */
+  laserTurnRate: number;
+  /** Damage per beam tick to a player caught in the beam. */
+  laserDamage: number;
+  /** Seconds between beam damage ticks. */
+  laserTickInterval: number;
+  /** Loot explosion on death: how many reward cubes drop (inclusive range). */
+  lootDropMin: number;
+  lootDropMax: number;
+}
+
+/**
+ * Black Devil shockwave expansion speed, in world units per second.
+ *
+ * This is THE knob for Attack 2's travel time: the ring races outward at this
+ * exact speed on both the server authority and the offline client AI, so the
+ * reaction window (dodge or reach cover) is identical in every mode. Exposed as
+ * a standalone constant because it is the single most-tuned boss value.
+ */
+export const SHOCKWAVE_EXPANSION_SPEED = 10;
+
 export interface EnemyBalance {
   walker: ZombieBalance;
   runner: ZombieBalance;
   devil: DevilBalance;
+  /** Wave-7 boss: black, 1.5× the red Devil, three synchronized attacks. */
+  blackDevil: BlackDevilBalance;
   /** Melee reach added to the zombie radius. */
   attackRange: number;
   /** Grace period between a zombie's melee hits, in seconds. */
@@ -642,6 +723,50 @@ export const ENEMY_CONFIG: EnemyBalance = {
     // damage taken per explosion, whatever the falloff — shared with GRENADE_CONFIG.damageToDevil
     explosiveDamageCap: DEVIL_EXPLOSIVE_CAP,
   },
+  // Wave-7 BLACK DEVIL — 1200 HP, three server-authoritative attacks:
+  //  A1 spinning fireball (4 orbiting cubes), A2 radial shockwave (<=3 u),
+  //  A3 telegraphed purple tracking laser (1 s telegraph + 3.5 s channel).
+  blackDevil: {
+    hp: 1200,
+    speed: 1.6,
+    damage: 20,
+    // ~1.5× the red Devil's rendered body (0.7 u × 1.15 scale ⇒ ~1.05 u here).
+    radius: 1.05,
+    score: 500,
+    // Three direct grenade blasts fell it (400 < 1200 ≤ 1200); one never does.
+    explosiveDamageCap: 400,
+    spinnerSpeed: 8,
+    spinnerLife: 5,
+    spinnerDamage: 18,
+    spinnerInterval: 2.6,
+    spinnerTurnRate: 0.9,
+    spinnerRangeMin: 3,
+    spinnerRangeMax: 13,
+    spinnerSpinRate: 9,
+    shockwaveRadius: 15,
+    shockwaveDamage: 25,
+    shockwaveCooldown: 4.5,
+    shockwaveTriggerRange: 10,
+    // 4 u ring at 12 u/s: a 0.33 s window to break line-of-sight behind cover.
+    shockwaveExpansionSpeed: SHOCKWAVE_EXPANSION_SPEED,
+    shockwaveRingThickness: 0.5,
+    // Curse: 5 HP/second until cleansed by a teammate's 3 s hold in the 2 u zone.
+    curseDamage: 5,
+    curseTickInterval: 1,
+    curseRadius: 2,
+    curseCleanseSeconds: 3,
+    laserTelegraph: 1.0,
+    laserDuration: 3.5,
+    laserCooldown: 8.0,
+    laserRange: 24,
+    laserHalfWidth: 0.7,
+    // Slack enough that a sprinting/strafe-dodging player can out-run the turn.
+    laserTurnRate: 0.5,
+    laserDamage: 10,
+    laserTickInterval: 0.25,
+    lootDropMin: 3,
+    lootDropMax: 4,
+  },
   attackRange: 1.05,
   attackCooldown: 0.9,
   wallAttackInterval: 0.5,
@@ -687,6 +812,10 @@ export interface DirectorBalance {
   runnerFromWave: number;
   devilFromWave: number;
   maxDevils: number;
+  /** Wave that hosts the Black Devil boss encounter. */
+  blackDevilWave: number;
+  /** Normal mob-count multiplier on the boss wave (0.5 = −50% small mobs). */
+  blackDevilMobCountMultiplier: number;
   /** Living-zombie count at (or below) which the survivors ENRAGE. */
   enrageThreshold: number;
   /** Movement-speed multiplier applied to enraged zombies (1.75 = +75%). */
@@ -730,6 +859,8 @@ export const DIRECTOR_CONFIG: DirectorBalance = {
   runnerFromWave: 2,
   devilFromWave: 3,
   maxDevils: 4,
+  blackDevilWave: 1,
+  blackDevilMobCountMultiplier: 0.5,
   /** Last-ditch sprint: no downtime once the wave is nearly cleared. */
   enrageThreshold: 3,
   enrageSpeedMultiplier: 1.75,
@@ -785,11 +916,12 @@ export interface FeelBalance {
   explosionTrauma: number;
   /** Trauma added by an explosive-barrel chain detonation (heavy rumble). */
   barrelChainTrauma: number;
+  /** Trauma added by the Black Devil's radial shockwave (subtle shake). */
+  shockwaveTrauma: number;
   /** Trauma shed per second — higher is a snappier, shorter shake. */
   traumaDecay: number;
   /** Maximum camera displacement in world units at full trauma. */
-  shakeMaxOffset: number;
-  /** Maximum camera roll in radians at full trauma. */
+  shakeMaxOffset: number;  /** Maximum camera roll in radians at full trauma. */
   shakeMaxRoll: number;
   /** Shake oscillator frequency in Hz (how fast the camera jitters). */
   shakeFrequency: number;
@@ -818,6 +950,8 @@ export const JUICE_CONFIG: FeelBalance = {
   explosionTrauma: 0.2,
   /** Task tuning: 0.35 s heavy directional rumble for a barrel chain. */
   barrelChainTrauma: 0.35,
+  /** Task tuning: 0.22 s subtle shake for the boss's close-range shockwave. */
+  shockwaveTrauma: 0.22,
   /** Trauma decays fully in ~1.4 s from 1.0. */
   traumaDecay: 0.7,
   /** Full-trauma shake nudges the camera by 0.35 world units. */
@@ -874,6 +1008,10 @@ export interface AudioBalance {
   pickup: SoundSpec;
   zombieHit: SoundSpec;
   zombieDeath: SoundSpec;
+  /** Black Devil radial shockwave (close-range boom). */
+  shockwave: SoundSpec;
+  /** Black Devil laser: rising charge hum at the start of each channel. */
+  laser: SoundSpec;
 }
 
 export const AUDIO_CONFIG: AudioBalance = {
@@ -894,6 +1032,10 @@ export const AUDIO_CONFIG: AudioBalance = {
   zombieHit: { volume: 0.35, duration: 0.1, freqStart: 180, freqEnd: 70, noise: 0.6, lowpass: 1200, wave: 'triangle' },
   /** Deeper, wetter crunch when a zombie dies. */
   zombieDeath: { volume: 0.5, duration: 0.24, freqStart: 140, freqEnd: 40, noise: 0.8, lowpass: 900, wave: 'sawtooth' },
+  /** Low sub-bass thump + a cushion of noise: the shockwave's pressure wave. */
+  shockwave: { volume: 0.85, duration: 0.5, freqStart: 120, freqEnd: 30, noise: 0.9, lowpass: 800, wave: 'sine' },
+  /** Rising sawtooth charge: the telegraph / beam wind-up sting. */
+  laser: { volume: 0.45, duration: 0.6, freqStart: 320, freqEnd: 900, noise: 0.15, lowpass: 4000, wave: 'sawtooth' },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

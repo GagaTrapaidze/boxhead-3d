@@ -121,6 +121,27 @@
       }
       #waveTimer[hidden] { display: none; }
 
+      /* Black Devil boss health bar — top-centre, shared by both players. */
+      #bossBar {
+        position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 7;
+        width: min(560px, 64vw); pointer-events: none; user-select: none; text-align: center;
+      }
+      #bossBar[hidden] { display: none; }
+      #bossName {
+        font-size: 17px; font-weight: 900; letter-spacing: 5px; color: #c86bff;
+        text-shadow: 0 1px 6px rgba(0,0,0,.95), 0 0 16px rgba(150,60,255,.85);
+        margin-bottom: 4px;
+      }
+      #bossTrack {
+        height: 15px; background: rgba(24, 4, 38, .78);
+        border: 1px solid rgba(200,120,255,.55); border-radius: 4px; overflow: hidden;
+      }
+      #bossFill {
+        display: block; height: 100%; width: 100%;
+        background: linear-gradient(90deg, #4a0a6e, #c86bff);
+        transition: width .12s linear;
+      }
+
       #message {
         position: fixed; top: 52px; left: 50%; transform: translateX(-50%); z-index: 6;
         color: #ffe9a0; font-size: 20px; font-weight: 700; text-align: center;
@@ -141,6 +162,15 @@
         text-shadow: 0 1px 6px rgba(0,0,0,.95); white-space: nowrap;
       }
       .mateLabel[hidden] { display: none; }
+      /* Curse cleansing progress labels above cursed bodies. */
+      #curseLabels { position: fixed; inset: 0; z-index: 7; pointer-events: none; }
+      .curseLabel {
+        position: fixed; transform: translate(-50%, -100%);
+        color: #7cf0ff; font-size: 15px; font-weight: 800; letter-spacing: 1px;
+        text-shadow: 0 1px 6px rgba(0,0,0,.95), 0 0 12px rgba(180,77,255,.85);
+        white-space: nowrap;
+      }
+      .curseLabel[hidden] { display: none; }
       #flash {
         position: fixed; inset: 0; z-index: 4; pointer-events: none; opacity: 0;
         transition: opacity .12s ease-out;
@@ -333,6 +363,10 @@
 
     <div id="hud" hidden>
       <div id="waveTimer" hidden>NEXT WAVE IN: 0.0s</div>
+      <div id="bossBar" hidden>
+        <div id="bossName">BLACK DEVIL</div>
+        <div id="bossTrack"><span id="bossFill"></span></div>
+      </div>
       <div id="sharedStats">
         <div id="multRow">
           <div class="multHead">MULTIPLIER ×<span id="multVal">1</span><span id="mult2" hidden></span></div>
@@ -372,6 +406,7 @@
     <div id="eventBanner" hidden></div>
     <div id="reviveLabel" hidden>REVIVING IN: 10s</div>
     <div id="mateLabels"></div>
+    <div id="curseLabels"></div>
 
     <div id="overlay">
       <!-- ============ START MENU ============ -->

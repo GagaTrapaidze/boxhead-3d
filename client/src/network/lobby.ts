@@ -49,6 +49,13 @@ export interface OnlinePlayer {
   aimZ: number;
   hp: number;
   weapon: number;
+  /**
+   * Black Devil "Curse": the player was struck by a shockwave and is bleeding
+   * ticking damage until a teammate stands in their cleansing circle for 3 s.
+   */
+  cursed: boolean;
+  /** Cleanse hold progress (0..1) — drives the radial cleansing indicator. */
+  cleanseProgress: number;
 }
 
 /** One authoritative mob as seen in the synchronized room state. */
@@ -64,6 +71,19 @@ export interface OnlineEnemy {
   maxHp: number;
   /** Devil only: phase-2 rage (burning / dashing) is active. */
   phase2: boolean;
+  /**
+   * Black Devil only: 0 idle, 1 laser telegraph (charge), 2 laser beam. While
+   * charging or firing the boss is frozen and every other attack is disabled.
+   */
+  attack: number;
+  /** Beam aim direction (unit vector) — drives the aim line / beam render. */
+  laserX: number;
+  laserZ: number;
+  /** Beam reach after the continuous raycast clamped it at the first obstacle
+   * (the render stops here so the laser never passes through walls / crates). */
+  laserLength: number;
+  /** Seconds left in the active laser phase (telegraph or channel). */
+  attackTimer: number;
   /** sessionId of the player this mob is chasing ("" = none). */
   target: string;
 }
@@ -96,12 +116,15 @@ export interface OnlineHazard {
   maxLife: number;
 }
 
-/** One Devil fireball in flight. */
+/** One enemy projectile in flight (fireball or Black Devil spinner). */
 export interface OnlineFireball {
+  kind: 'fireball' | 'spinner';
   x: number;
   z: number;
   dirX: number;
   dirZ: number;
+  /** Spinner orbit phase (radians), synchronized to both clients. */
+  spin: number;
 }
 
 /** One-shot event: a mob died (the room decides when, everyone reacts at once). */
@@ -119,6 +142,17 @@ export interface ExplosionEvent {
   x: number;
   z: number;
   radius: number;
+}
+
+/** One-shot event: the Black Devil fired a radial shockwave. */
+export interface ShockwaveEvent {
+  x: number;
+  z: number;
+  /** Outer radius the ring expands to. */
+  radius: number;
+  /** Expansion speed (world units/second) — the ring's travel time must match
+   * the server's collision sweep, so the FX uses this rather than a fixed life. */
+  speed: number;
 }
 
 /** One-shot event: a deployable was destroyed (barrel blast or crate splinters). */
@@ -177,6 +211,8 @@ export interface LobbyHandlers {
   onPropDestroyed: (event: PropDestroyedEvent) => void;
   /** A barrel blast happened — play the flash / shake at that point. */
   onExplosion: (event: ExplosionEvent) => void;
+  /** The boss fired a radial shockwave — play the ring + subtle screen shake. */
+  onShockwave: (event: ShockwaveEvent) => void;
   /** The server dealt damage to this client's player (melee / hazard / blast). */
   onDamagePlayer: (amount: number) => void;
   /** A walk-over pickup was granted by the server. */
@@ -203,6 +239,8 @@ interface RawPlayer {
   aimZ: number;
   hp: number;
   weapon: number;
+  cursed: boolean;
+  cleanseProgress: number;
 }
 
 interface RawEnemy {
@@ -214,6 +252,11 @@ interface RawEnemy {
   hp: number;
   maxHp: number;
   phase2: boolean;
+  attack: number;
+  laserX: number;
+  laserZ: number;
+  laserLength: number;
+  attackTimer: number;
   target: string;
 }
 
@@ -242,10 +285,12 @@ interface RawHazard {
 }
 
 interface RawFireball {
+  kind: number;
   x: number;
   z: number;
   dirX: number;
   dirZ: number;
+  spin: number;
 }
 
 /** A Colyseus map-like collection (MapSchema). */
@@ -476,6 +521,14 @@ export class Lobby {
     room.onMessage('explosion', (msg: { x: number; z: number; radius: number }) => {
       this.handlers.onExplosion({ x: msg.x, z: msg.z, radius: msg.radius });
     });
+    room.onMessage('shockwave', (msg: { x: number; z: number; radius: number; speed?: number }) => {
+      this.handlers.onShockwave({
+        x: msg.x,
+        z: msg.z,
+        radius: msg.radius,
+        speed: msg.speed ?? 0,
+      });
+    });
     room.onMessage('damagePlayer', (msg: { amount: number }) => {
       this.handlers.onDamagePlayer(msg.amount);
     });
@@ -549,6 +602,8 @@ export class Lobby {
         aimZ: player.aimZ,
         hp: player.hp,
         weapon: player.weapon,
+        cursed: player.cursed === true,
+        cleanseProgress: player.cleanseProgress ?? 0,
       });
     });
     players.sort((a, b) => a.seat - b.seat);
@@ -564,6 +619,11 @@ export class Lobby {
         hp: enemy.hp,
         maxHp: enemy.maxHp,
         phase2: enemy.phase2 === true,
+        attack: enemy.attack ?? 0,
+        laserX: enemy.laserX ?? 0,
+        laserZ: enemy.laserZ ?? 0,
+        laserLength: enemy.laserLength ?? 0,
+        attackTimer: enemy.attackTimer ?? 0,
         target: enemy.target ?? '',
       });
     });
@@ -603,7 +663,14 @@ export class Lobby {
 
     const fireballs: OnlineFireball[] = [];
     state.fireballs?.forEach((ball) => {
-      fireballs.push({ x: ball.x, z: ball.z, dirX: ball.dirX, dirZ: ball.dirZ });
+      fireballs.push({
+        kind: ball.kind === 1 ? 'spinner' : 'fireball',
+        x: ball.x,
+        z: ball.z,
+        dirX: ball.dirX,
+        dirZ: ball.dirZ,
+        spin: ball.spin ?? 0,
+      });
     });
 
     const phase = state.phase === 'playing' ? 'playing' : 'lobby';

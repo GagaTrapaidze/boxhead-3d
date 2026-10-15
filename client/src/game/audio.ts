@@ -98,6 +98,16 @@ export class AudioManager {
     this.play(AUDIO_CONFIG.zombieDeath, 0.85 + Math.random() * 0.3);
   }
 
+  /** Black Devil shockwave: low sub-bass boom + noise pressure wave. */
+  shockwave(): void {
+    this.play(AUDIO_CONFIG.shockwave);
+  }
+
+  /** Black Devil laser: rising charge sting when the beam / telegraph starts. */
+  laser(): void {
+    this.play(AUDIO_CONFIG.laser);
+  }
+
   // ── Internals ──────────────────────────────────────────────────────────────
 
   private ensureGraph(): AudioContext | null {

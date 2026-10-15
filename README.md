@@ -70,6 +70,11 @@ node scripts/online-world-browser-check.mjs   # same requirements as above
 
 # local 2-player downed → passive revive → Game Over (guards the local rules)
 node scripts/local-revive-check.mjs    # needs dev:client + Chrome on :9333
+
+# Wave-7 Black Devil boss: black mesh + dedicated top-centre "BLACK DEVIL" HP
+# bar, the 3 u/4.5 s shockwave, the 1 s → 3.5 s tracking laser, the 4-cube
+# spinner projectile and the 3–4 reward loot explosion
+node scripts/black-devil-browser-check.mjs   # same requirements as above
 ```
 
 ## Deployment (Render + Vercel)

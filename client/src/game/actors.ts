@@ -399,6 +399,11 @@ export function setZombieEyeGlow(intensity: number): void {
   if (eye) eye.emissiveIntensity = intensity;
 }
 
+/** Rendered scale of the standard red Devil model (see spawnZombie). */
+export const DEVIL_SCALE = 1.15;
+/** The Black Devil reads ~1.5× larger than the red Devil (1.15 × 1.5 ≈ 1.7). */
+export const BLACK_DEVIL_SCALE = 1.7;
+
 /** Red/orange boxy boss with horns and burning eyes. */
 export function buildDevil(): THREE.Group {
   const group = new THREE.Group();
@@ -454,7 +459,7 @@ export function buildDevil(): THREE.Group {
   return group;
 }
 
-export type PickupKind = 'shotgun' | 'uzi' | 'grenade' | 'barrel' | 'power';
+export type PickupKind = 'shotgun' | 'uzi' | 'grenade' | 'barrel' | 'power' | 'health';
 
 /** Distinct indicator colours so a drop is readable at a glance mid-fight. */
 export const PICKUP_COLORS: Record<PickupKind, number> = {
@@ -463,6 +468,7 @@ export const PICKUP_COLORS: Record<PickupKind, number> = {
   grenade: 0x2f7d32, // dark green — grenades
   barrel: 0xff7a1a, // orange — explosive barrels
   power: 0xd78bff, // purple — POWER x2
+  health: 0x64ffda, // teal — health pack (boss loot)
 };
 
 /** Small colored box that bobs above the ground. */
@@ -486,6 +492,85 @@ export function buildFireballMesh(): THREE.Mesh {
     })
   );
   return mesh;
+}
+
+/**
+ * The Wave-7 BLACK DEVIL — a pitch-black, horned blocky boss roughly 1.5× the
+ * red Devil (the spawner applies {@link BLACK_DEVIL_SCALE}). Its eyes and a
+ * faint body light burn violet so it stays readable against the dark arena.
+ */
+export function buildBlackDevil(): THREE.Group {
+  const group = new THREE.Group();
+
+  const body = box(0.9, 1.1, 0.6, 0x0a0a0c);
+  body.position.y = 0.55;
+  const head = box(0.6, 0.55, 0.6, 0x16161c);
+  head.position.y = 1.35;
+
+  const horn = surfaceMaterial('blackDevil:horn', { color: 0x040407, roughness: 0.5 });
+  const leftHorn = new THREE.Mesh(boxGeometry(0.14, 0.34, 0.14), horn);
+  leftHorn.position.set(-0.22, 1.74, 0);
+  const rightHorn = new THREE.Mesh(boxGeometry(0.14, 0.34, 0.14), horn);
+  rightHorn.position.set(0.22, 1.74, 0);
+
+  const eyeMaterial = surfaceMaterial('blackDevil:eye', {
+    color: 0xc86bff,
+    emissive: 0x8a2bff,
+    emissiveIntensity: 1.3,
+  });
+  const leftEye = new THREE.Mesh(boxGeometry(0.13, 0.11, 0.06), eyeMaterial);
+  leftEye.position.set(-0.15, 1.4, 0.31);
+  const rightEye = new THREE.Mesh(boxGeometry(0.13, 0.11, 0.06), eyeMaterial);
+  rightEye.position.set(0.15, 1.4, 0.31);
+
+  group.add(body, head, leftHorn, rightHorn, leftEye, rightEye);
+
+  // A faint violet aura so the pitch-black body never vanishes into the floor.
+  const aura = new THREE.PointLight(0x9a4dff, 1.1, 7, 2);
+  aura.position.set(0, 1.35, 0);
+  group.add(aura);
+
+  return group;
+}
+
+/** Spinner orbit radius (world units) — a tight ring around the core. */
+export const SPINNER_ORBIT_RADIUS = 0.34;
+
+/**
+ * Attack 1 projectile — a "loading spinner": four glowing violet cubes orbiting
+ * a dark core. The returned group spins about Y (see projectiles.ts / the online
+ * mirror), which reads as the cubes whirling around the ring as it flies.
+ */
+export function buildSpinnerMesh(): THREE.Group {
+  const group = new THREE.Group();
+
+  const core = new THREE.Mesh(
+    boxGeometry(0.14, 0.14, 0.14),
+    surfaceMaterial('projectile:spinnerCore', {
+      color: 0x2a1240,
+      emissive: 0x5a1fa8,
+      emissiveIntensity: 0.7,
+    })
+  );
+  group.add(core);
+
+  const cubeMaterial = surfaceMaterial('projectile:spinnerCube', {
+    color: 0xc86bff,
+    emissive: 0x9a3cff,
+    emissiveIntensity: 1.5,
+  });
+  for (let i = 0; i < 4; i++) {
+    const angle = (i / 4) * Math.PI * 2;
+    const cube = new THREE.Mesh(boxGeometry(0.18, 0.18, 0.18), cubeMaterial);
+    cube.position.set(
+      Math.cos(angle) * SPINNER_ORBIT_RADIUS,
+      0,
+      Math.sin(angle) * SPINNER_ORBIT_RADIUS
+    );
+    group.add(cube);
+  }
+
+  return group;
 }
 
 /**

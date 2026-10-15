@@ -58,6 +58,14 @@ export const PlayerPresence = schema(
     aimZ: 'float32',
     hp: 'uint8',
     weapon: 'uint8',
+    //
+    // Black Devil "Curse" (co-op): set the instant a shockwave lands on this
+    // player. While true the client draws the 2 u cleansing circle around them
+    // and the server bleeds `curseDamage` on the configured interval.
+    cursed: 'boolean',
+    /** Cleanse hold progress (0..1): a teammate inside the circle for 3 s lifts
+     * the curse. Both clients render the same radial progress indicator. */
+    cleanseProgress: 'float32',
   },
   'PlayerPresence'
 );
@@ -78,6 +86,20 @@ export const EnemyState = schema(
     maxHp: 'uint16',
     /** Devil only: phase-2 rage (burning / dashing) is active. */
     phase2: 'boolean',
+    /**
+     * Black Devil only: attack state — 0 idle, 1 laser telegraph (charge),
+     * 2 laser beam channel. While charge/fire the boss is frozen and every
+     * other attack is disabled.
+     */
+    attack: 'uint8',
+    /** Beam aim direction (unit vector) — clients draw the telegraph/beam. */
+    laserX: 'float32',
+    laserZ: 'float32',
+    /** Beam reach after the continuous raycast clamps it at the first wall /
+     * crate (clients draw the telegraph and beam only this far). */
+    laserLength: 'float32',
+    /** Seconds left in the active laser phase (telegraph or channel). */
+    attackTimer: 'float32',
     /** sessionId of the player this mob is currently chasing ("" = none). */
     target: 'string',
   },
@@ -121,9 +143,18 @@ export const HazardState = schema(
 );
 export type HazardState = SchemaType<typeof HazardState>;
 
-/** One authoritative Devil fireball in flight. */
+/** One authoritative enemy projectile in flight (fireball or spinner). */
 export const FireballState = schema(
-  { x: 'float32', z: 'float32', dirX: 'float32', dirZ: 'float32' },
+  {
+    /** 0 = red Devil fireball, 1 = Black Devil spinner (4 orbiting cubes). */
+    kind: 'uint8',
+    x: 'float32',
+    z: 'float32',
+    dirX: 'float32',
+    dirZ: 'float32',
+    /** Spinner orbit phase in radians (synchronized so both clients agree). */
+    spin: 'float32',
+  },
   'FireballState'
 );
 export type FireballState = SchemaType<typeof FireballState>;
@@ -278,6 +309,13 @@ export class CoopRoom extends Room {
       player.alive = false;
       player.hp = 0;
       player.respawnTimer = COOP_CONFIG.reviveCountdown;
+      // Downing a cursed player lifts their curse immediately ("until cleansed
+      // or dies"), freeing the single-curse slot for a teammate. It also opens
+      // the respawn / revive immunity window: while this body is down, the
+      // simulation's curse guards refuse to curse anyone.
+      this.sim.clearCurse(client.sessionId);
+      player.cursed = false;
+      player.cleanseProgress = 0;
       this.checkGameOver();
     });
 
@@ -426,6 +464,13 @@ export class CoopRoom extends Room {
         });
       } else if (event.type === 'explosion') {
         this.broadcast('explosion', { x: event.x, z: event.z, radius: event.radius });
+      } else if (event.type === 'shockwave') {
+        this.broadcast('shockwave', {
+          x: event.x,
+          z: event.z,
+          radius: event.radius,
+          speed: event.speed,
+        });
       } else if (event.type === 'waveStart') {
         this.broadcast('waveStart', { wave: event.wave, event: event.event });
       } else {
@@ -443,6 +488,14 @@ export class CoopRoom extends Room {
     this.state.event = this.sim.event;
     this.state.directorPhase = this.sim.phase;
     this.state.directorTimer = Math.max(0, this.sim.timer);
+
+    // Curse status is sim-owned: mirror it onto each player so both clients see
+    // the cleansing circle and its progress bar the moment it changes.
+    this.state.players.forEach((player, sessionId) => {
+      const cursed = this.sim.isCursed(sessionId);
+      player.cursed = cursed;
+      player.cleanseProgress = cursed ? this.sim.curseProgressOf(sessionId) : 0;
+    });
 
     // enemies
     const enemyKeys = new Set<string>();
@@ -462,6 +515,12 @@ export class CoopRoom extends Room {
       entry.hp = Math.max(0, Math.round(enemy.hp));
       entry.maxHp = enemy.maxHp;
       entry.phase2 = enemy.phase2;
+      entry.attack =
+        enemy.attackState === 'charge' ? 1 : enemy.attackState === 'fire' ? 2 : 0;
+      entry.laserX = enemy.laserDirX;
+      entry.laserZ = enemy.laserDirZ;
+      entry.laserLength = enemy.laserLength;
+      entry.attackTimer = Math.max(0, enemy.attackTimer);
       entry.target = enemy.target;
     }
     this.pruneMap(this.state.enemies, enemyKeys);
@@ -522,10 +581,12 @@ export class CoopRoom extends Room {
     for (let i = 0; i < this.sim.fireballs.length; i++) {
       const ball = this.sim.fireballs[i];
       const entry = new FireballState();
+      entry.kind = ball.kind === 'spinner' ? 1 : 0;
       entry.x = ball.x;
       entry.z = ball.z;
       entry.dirX = ball.dirX;
       entry.dirZ = ball.dirZ;
+      entry.spin = ball.spin;
       this.state.fireballs.set(fireballIds[i], entry);
     }
   }
@@ -608,6 +669,8 @@ export class CoopRoom extends Room {
     player.aimZ = 0;
     player.hp = PLAYER_MAX_HP;
     player.weapon = 0;
+    player.cursed = false;
+    player.cleanseProgress = 0;
     this.state.players.set(client.sessionId, player);
 
     // First player in becomes the host.
@@ -652,6 +715,8 @@ export class CoopRoom extends Room {
   }
 
   private removePlayer(sessionId: string): void {
+    // A departed player never keeps the single-curse slot alive.
+    this.sim.clearCurse(sessionId);
     this.state.players.delete(sessionId);
     if (this.state.hostId === sessionId) {
       // Elect the lowest-seated remaining player as the new host.

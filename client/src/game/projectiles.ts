@@ -8,11 +8,11 @@
 import * as THREE from 'three';
 
 import { GridMap } from '../../../shared/src/grid.ts';
-import { buildFireballMesh, buildGrenadeMesh, buildRocketMesh } from './actors.ts';
+import { buildFireballMesh, buildGrenadeMesh, buildRocketMesh, buildSpinnerMesh } from './actors.ts';
 import type { WeaponDef } from '../../../shared/src/weapons.ts';
 import { GRENADE_CONFIG, ENEMY_CONFIG, FX_CONFIG, PHYSICS_CONFIG } from '../../../shared/src/balance.config.ts';
 
-export type ProjectileKind = 'grenade' | 'rocket' | 'fireball';
+export type ProjectileKind = 'grenade' | 'rocket' | 'fireball' | 'spinner';
 
 export interface Projectile {
   kind: ProjectileKind;
@@ -26,13 +26,16 @@ export interface Projectile {
   y: number;
   /** Vertical velocity; only grenades use it. */
   vy: number;
-  /** Heading in radians (fireballs steer; grenades/rockets fly straight). */
+  /** Heading in radians (fireballs/spinners steer; grenades/rockets are straight). */
   angle: number;
   speed: number;
   life: number;
   damage: number;
   radius: number;
-  mesh: THREE.Mesh;
+  /** Orbit phase of a spinner's cubes (radians); 0 for every other kind. */
+  spin: number;
+  /** Grenades/rockets/fireballs use a Mesh; spinners use a rotating Group. */
+  mesh: THREE.Object3D;
 }
 
 export interface ExplosionEvent {
@@ -79,6 +82,10 @@ export interface Flash {
 // dud timeout, mine fuse) — see balance.config.ts.
 const FIREBALL_LIFE = ENEMY_CONFIG.fireballLife;
 const FIREBALL_TURN = ENEMY_CONFIG.fireballTurnRate; // rad/s homing capability
+/** Black Devil attack tuning (Attack 1 spinner projectile). */
+const BLACK_DEVIL = ENEMY_CONFIG.blackDevil;
+/** A spinner hits a player within this radius (mirrors the server). */
+const SPINNER_HIT_RADIUS = 0.55;
 const FLASH_LIFE = FX_CONFIG.explosionFlashLife;
 
 // Grenade arc physics: an upward launch, gravity, and a damped ground bounce.
@@ -120,6 +127,7 @@ export function spawnPlayerProjectile(
     life: def.lifeSeconds,
     damage: def.damage,
     radius: def.explosionRadius,
+    spin: 0,
     mesh,
   });
 }
@@ -146,6 +154,38 @@ export function spawnFireball(
     life: FIREBALL_LIFE,
     damage: ENEMY_CONFIG.fireballDamage,
     radius: 0,
+    spin: 0,
+    mesh,
+  });
+}
+
+/**
+ * Spawns the Black Devil's Attack 1: a ring of 4 orbiting cubes that travels
+ * toward the target player (the local offline twin of the server's spinner).
+ */
+export function spawnSpinner(
+  scene: THREE.Scene,
+  list: Projectile[],
+  x: number,
+  z: number,
+  angle: number
+): void {
+  const mesh = buildSpinnerMesh();
+  mesh.position.set(x, 1.0, z);
+  scene.add(mesh);
+  list.push({
+    kind: 'spinner',
+    ownerIndex: -1,
+    x,
+    z,
+    y: 1.0,
+    vy: 0,
+    angle,
+    speed: BLACK_DEVIL.spinnerSpeed,
+    life: BLACK_DEVIL.spinnerLife,
+    damage: BLACK_DEVIL.spinnerDamage,
+    radius: 0,
+    spin: 0,
     mesh,
   });
 }
@@ -254,8 +294,10 @@ export function updateProjectiles(
     const projectile = list[i];
     projectile.life -= dt;
 
-    if (projectile.kind === 'fireball') {
-      // home toward the nearest alive player
+    if (projectile.kind === 'fireball' || projectile.kind === 'spinner') {
+      const spinner = projectile.kind === 'spinner';
+      const turnRate = spinner ? BLACK_DEVIL.spinnerTurnRate : FIREBALL_TURN;
+      // home toward the nearest alive player (spinners only barely steer)
       let target: { x: number; z: number } | null = null;
       let best = Infinity;
       for (const player of world.players) {
@@ -271,20 +313,25 @@ export function updateProjectiles(
         let delta = desired - projectile.angle;
         while (delta > Math.PI) delta -= Math.PI * 2;
         while (delta < -Math.PI) delta += Math.PI * 2;
-        const turn = Math.max(-FIREBALL_TURN * dt, Math.min(FIREBALL_TURN * dt, delta));
+        const turn = Math.max(-turnRate * dt, Math.min(turnRate * dt, delta));
         projectile.angle += turn;
       }
 
       projectile.x += Math.cos(projectile.angle) * projectile.speed * dt;
       projectile.z += Math.sin(projectile.angle) * projectile.speed * dt;
       projectile.mesh.position.set(projectile.x, 1.0, projectile.z);
+      if (spinner) {
+        // whirl the orbiting cube ring as it flies
+        projectile.spin += BLACK_DEVIL.spinnerSpinRate * dt;
+        projectile.mesh.rotation.y = projectile.spin;
+      }
 
       // direct hit on a player
       let consumed = false;
       for (let p = 0; p < world.players.length; p++) {
         const player = world.players[p];
         if (!player.alive) continue;
-        if (Math.hypot(player.x - projectile.x, player.z - projectile.z) < 0.55) {
+        if (Math.hypot(player.x - projectile.x, player.z - projectile.z) < SPINNER_HIT_RADIUS) {
           events.playerDamage.set(p, (events.playerDamage.get(p) ?? 0) + projectile.damage);
           consumed = true;
           break;

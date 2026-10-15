@@ -17,7 +17,8 @@ import { buildPickup } from './actors.ts';
 import type { PickupKind } from './actors.ts';
 import { WeaponId, getWeapon } from '../../../shared/src/weapons.ts';
 import { WAVE_CONFIG } from '../../../shared/src/balance.config.ts';
-import { POWER_DURATION, grantWeapon, isWeaponAvailable } from './player.ts';
+import { bossLootCount, pickBossLoot } from '../../../shared/src/loot.ts';
+import { PLAYER_MAX_HP, POWER_DURATION, grantWeapon, isWeaponAvailable } from './player.ts';
 import type { Player } from './player.ts';
 
 export interface Pickup {
@@ -47,7 +48,7 @@ export interface PickupAward {
   label: string;
 }
 
-export const PICKUP_AWARD: Record<Exclude<PickupKind, 'power'>, PickupAward> = {
+export const PICKUP_AWARD: Record<Exclude<PickupKind, 'power' | 'health'>, PickupAward> = {
   shotgun: { weaponId: WeaponId.Shotgun, amount: WAVE_CONFIG.pickupAwards.shotgun, label: 'SHOTGUN' },
   uzi: { weaponId: WeaponId.Uzi, amount: WAVE_CONFIG.pickupAwards.uzi, label: 'UZI' },
   grenade: { weaponId: WeaponId.Grenade, amount: WAVE_CONFIG.pickupAwards.grenade, label: 'GRENADES' },
@@ -74,6 +75,32 @@ export function pickKind(random: () => number = Math.random): PickupKind {
     if (roll < 0) return kind;
   }
   return DROP_WEIGHTS[DROP_WEIGHTS.length - 1][0];
+}
+
+/**
+ * The Black Devil's death "loot explosion": 3–4 reward cubes scattered around
+ * its footprint (the offline twin of the room's server-side kill reward).
+ * Returns how many cubes were dropped.
+ */
+export function spawnBossLoot(
+  scene: THREE.Scene,
+  list: Pickup[],
+  x: number,
+  z: number
+): number {
+  const count = bossLootCount();
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const distance = 0.4 + Math.random() * 1.1;
+    spawnPickup(
+      scene,
+      list,
+      x + Math.cos(angle) * distance,
+      z + Math.sin(angle) * distance,
+      pickBossLoot()
+    );
+  }
+  return count;
 }
 
 export function spawnPickup(
@@ -114,6 +141,13 @@ export function applyPickup(player: Player, kind: PickupKind): string {
   if (kind === 'power') {
     player.powerTimer = POWER_DURATION;
     return 'POWER ×2!';
+  }
+
+  // Health pack (Black Devil boss loot): restore HP, capped at the max.
+  if (kind === 'health') {
+    const before = player.hp;
+    player.hp = Math.min(PLAYER_MAX_HP, player.hp + WAVE_CONFIG.healthRestore);
+    return `HEALTH +${Math.round(player.hp - before)}`;
   }
 
   const award = PICKUP_AWARD[kind];

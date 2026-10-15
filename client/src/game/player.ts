@@ -16,6 +16,7 @@ import {
   resetMultiplier,
 } from '../../../shared/src/combo.ts';
 import { PLAYER_CONFIG } from '../../../shared/src/balance.config.ts';
+import type { CurseState } from '../../../shared/src/curse.ts';
 import { CHARACTERS, buildBoxhead } from './actors.ts';
 import type { CharacterId } from './actors.ts';
 
@@ -89,6 +90,20 @@ export interface Player {
   invulnTimer: number;
   /** Blink accumulator driving the downed / invulnerable flashing. */
   blinkTimer: number;
+  /**
+   * Black Devil "Curse" (co-op): true while a shockwave-inflicted curse is
+   * active. Set from the server mirror online, from the offline AI locally.
+   * A cursed player bleeds ticking damage until a teammate stands in their
+   * cleansing circle for 3 s.
+   */
+  cursed: boolean;
+  /** Cleanse hold progress (0..1) — drives the ground-circle indicator. */
+  cleanseProgress: number;
+  /**
+   * Offline-only curse runtime (tick clock + cleanse hold). Null when not
+   * cursed; the server owns this state entirely in an online match.
+   */
+  curse: CurseState | null;
   mesh: THREE.Group;
 }
 
@@ -131,6 +146,9 @@ export function createPlayer(
     reviveHold: 0,
     invulnTimer: 0,
     blinkTimer: 0,
+    cursed: false,
+    cleanseProgress: 0,
+    curse: null,
     mesh,
   };
 }
