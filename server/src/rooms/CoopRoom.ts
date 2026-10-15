@@ -37,7 +37,7 @@ import {
 import { COOP_CONFIG, ENEMY_CONFIG, WAVE_CONFIG } from '../../../shared/src/balance.config.ts';
 import { DEFAULT_MAP_ID, getMap } from '../../../shared/src/maps.ts';
 import { dropKindCode, enemyKindCode, propKindCode } from '../../../shared/src/loot.ts';
-import type { PropKind } from '../../../shared/src/loot.ts';
+import type { DropKind, PropKind } from '../../../shared/src/loot.ts';
 import { WorldSim } from './world.ts';
 
 /** One player's synchronized presence inside the room. */
@@ -396,6 +396,11 @@ export class CoopRoom extends Room {
     );
 
     // --- loot: walk-over pickup, granted by the server ------------------------
+    // The room already collects every walk-over on its own tick (see
+    // `collectWalkOverDrops`), so this is only a client's *fast path* to the
+    // same grant — it saves up to one tick of latency. Both entry points funnel
+    // through `grantDrop`, which is idempotent per drop, so a request that races
+    // the sweep can never double-credit the team pool.
     this.onMessage('pickupItem', (client: Client, msg: { id?: number; x?: number; z?: number }) => {
       if (!this.isLive()) return;
       const player = this.state.players.get(client.sessionId);
@@ -403,15 +408,7 @@ export class CoopRoom extends Room {
       const id = readCell(msg?.id);
       if (id === null) return;
       // Trust the *server's* copy of the player position, not the message's.
-      const kind = this.sim.pickup(id, player.x, player.z);
-      if (!kind) return;
-      // The drop itself is gone from `sim.drops` → it leaves `state.drops` on
-      // this same tick, so the cube vanishes for BOTH clients immediately.
-      // Loot is a shared team benefit: it credits the team pool and is granted
-      // to *every* client (each applies it to its own player), never just the
-      // collector.
-      this.state.teamScore += WAVE_CONFIG.pickupScore;
-      this.broadcast('granted', { kind: dropKindCode(kind), by: client.sessionId });
+      this.grantDrop(id, client.sessionId);
     });
 
     // Fixed-rate clock (shared TICK_RATE, 30 Hz): advances the world and the
@@ -422,6 +419,55 @@ export class CoopRoom extends Room {
   /** True while a live match is running (not lobby, not game over). */
   private isLive(): boolean {
     return this.state.phase === 'playing' && !this.state.matchOver;
+  }
+
+  /**
+   * Grants one ground drop to one player, if the server agrees that player is
+   * standing on it. Eligibility is purely positional: every connected, living
+   * player is a candidate for every drop — there is no character, skin or seat
+   * involved anywhere in this path.
+   *
+   * The drop itself is gone from `sim.drops` → it leaves `state.drops` on this
+   * same tick, so the cube vanishes for BOTH clients immediately. Loot is a
+   * shared team benefit: it credits the team pool and is granted to *every*
+   * client (each applies it to its own player), never just the collector. The
+   * `by` field names the player who actually walked it over.
+   *
+   * Returns the collected kind, or null when the drop is gone / out of reach.
+   */
+  private grantDrop(dropId: number, sessionId: string): DropKind | null {
+    const player = this.state.players.get(sessionId);
+    if (!player || !player.alive) return null;
+    const kind = this.sim.pickup(dropId, player.x, player.z);
+    if (!kind) return null;
+    this.state.teamScore += WAVE_CONFIG.pickupScore;
+    this.broadcast('granted', { kind: dropKindCode(kind), by: sessionId });
+    return kind;
+  }
+
+  /**
+   * Server-authoritative walk-over collision: every connected, living player is
+   * tested against every active drop on each simulation tick.
+   *
+   * This is the rule that makes loot collection player-agnostic by construction:
+   * the room compares its OWN registered copy of each player's position (Bon,
+   * Boxhead, seat 0 or seat 3 — they are all just rows in `state.players`) with
+   * each drop's position in `state.drops`, at the shared `WAVE_CONFIG.pickupRadius`
+   * bounding radius. No client request, character id or skin is consulted, so a
+   * player whose walk-over message is lost (or that races the presence relay)
+   * still collects the cube on the next tick.
+   */
+  private collectWalkOverDrops(): void {
+    if (this.sim.drops.length === 0) return;
+    this.state.players.forEach((player, sessionId) => {
+      // A disconnected (reconnecting) or downed body never collects loot.
+      if (!player.alive || !player.connected) return;
+      // One cube per player per tick: `sim.drops` is spliced by a grant, so
+      // iterate a snapshot and stop at this player's first collection.
+      for (const drop of [...this.sim.drops]) {
+        if (this.grantDrop(drop.id, sessionId)) return;
+      }
+    });
   }
 
   /** Resets the room to a fresh, fully-alive match (initial start and restart). */
@@ -457,6 +503,9 @@ export class CoopRoom extends Room {
         this.sim.step(dt);
         this.flushPlayerDamage();
         this.flushEvents();
+        // The room owns walk-over collection: every connected player is tested
+        // against every active drop, whatever character they are playing.
+        this.collectWalkOverDrops();
       }
       this.syncWorld();
     }

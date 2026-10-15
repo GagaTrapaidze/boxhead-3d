@@ -18,8 +18,9 @@
  *    blast);
  *  - `damageEnemy` kills → `enemyKilled` broadcast (with the killer's id) and the
  *    mob removed from state for everyone;
- *  - kills roll loot into `state.drops`, and `pickupItem` grants + removes it for
- *    both clients;
+ *  - kills roll loot into `state.drops`, and the room's OWN walk-over collision
+ *    (all players × all drops, every tick) grants + removes it for both clients
+ *    — identically for the host and for the second player (seat 1);
  *  - the wave director is mirrored into the room state;
  *  - the shared team score (`state.teamScore`) is credited by the room for kills
  *    and loot, patches the identical value to both clients, and resets on a
@@ -258,16 +259,16 @@ try {
   await waitFor(guestRoom, (s) => s.drops.get(String(drop.id)), 'guest sees the drop');
   assert(guestRoom.state.drops.get(String(drop.id)).kind === drop.kind, 'drop replicated to the peer');
 
-  // Walk the host onto the drop, then ask the room to grant it. The presence
-  // pump is stopped first so it cannot drag the player back off the drop.
+  // Walk the host onto the drop. The presence pump is stopped first so it
+  // cannot drag the player back off the drop. The ROOM owns the collision: no
+  // `pickupItem` message is needed — the next simulation tick grants the cube
+  // to the player standing on it and broadcasts the award to every client.
   clearInterval(presenceTimer);
   presenceTimer = null;
-  hostRoom.send('presence', { x: drop.x, z: drop.z, aimX: 1, aimZ: 0, hp: 100, weapon: 0 });
-  await sleep(200);
   const scoreBeforePickup = hostRoom.state.teamScore;
   const peerGranted = nextMessage(guestRoom, 'granted'); // the peer must hear it too
   const granted = nextMessage(hostRoom, 'granted');
-  hostRoom.send('pickupItem', { id: drop.id, x: drop.x, z: drop.z });
+  hostRoom.send('presence', { x: drop.x, z: drop.z, aimX: 1, aimZ: 0, hp: 100, weapon: 0 });
   const award = await granted;
   const sharedAward = await peerGranted;
   assert(typeof award.kind === 'number', `pickup granted (kind ${award.kind})`);
@@ -296,6 +297,88 @@ try {
   assert(
     !guestRoom.state.drops.get(String(drop.id)),
     'collected drop left the state for every client'
+  );
+
+  // A redundant client request for the cube that is already gone must be a
+  // no-op: loot can never be double-credited by the pairing of the fast path
+  // with the room's own walk-over sweep. Nothing else can move the pool here —
+  // no further kills are reported, and every cube already in reach has been
+  // swept — so the total must stand still across the request.
+  await sleep(300);
+  const scoreAtRequest = hostRoom.state.teamScore;
+  hostRoom.send('pickupItem', { id: drop.id, x: drop.x, z: drop.z });
+  await sleep(400);
+  assert(
+    hostRoom.state.teamScore === scoreAtRequest,
+    `a request for an already-collected drop never double-credits the team pool (${scoreAtRequest} → ${hostRoom.state.teamScore})`
+  );
+
+  // --- 3b. the SECOND player collects just the same -------------------------
+  // The reported failure mode: a player who is not the host (seat 1, the
+  // "Bon" skin on that client) must be able to walk over any drop — including
+  // a shotgun — with no character- or seat-specific rule in the way.
+  console.log('\n[3b] the second player collects drops just the same');
+  /** Distance of a cube from the two parked players (both stand at 20/21, 20). */
+  const awayFromPlayers = (cube) => Math.min(Math.hypot(cube.x - 20, cube.z - 20), Math.hypot(cube.x - 21, cube.z - 20));
+  let second = null;
+  for (let round = 0; round < 60 && !second; round++) {
+    // Only cubes the peer has also seen, and far enough from the parked host
+    // that the room's own sweep cannot claim them before the guest arrives.
+    const live = [...hostRoom.state.drops.values()]
+      .filter((candidate) => guestRoom.state.drops.get(String(candidate.id)))
+      .filter((candidate) => awayFromPlayers(candidate) > 2)
+      .sort((a, b) => awayFromPlayers(b) - awayFromPlayers(a));
+    if (live.length > 0) {
+      second = live[0];
+      break;
+    }
+    const ids = [...hostRoom.state.enemies.values()].map((enemy) => enemy.id);
+    if (ids.length === 0) {
+      // Between waves: wait for the director's next spawn batch.
+      await waitFor(hostRoom, (s) => s.enemies.size > 0, 'next spawn batch', 30000);
+      continue;
+    }
+    for (const id of ids.slice(0, 6)) {
+      hostRoom.send('damageEnemy', { id, damage: 10000, weaponId: 0 });
+    }
+    await sleep(150);
+  }
+  assert(!!second, `a drop is on the ground for the second player (id ${second?.id})`);
+
+  const guestScoreBefore = hostRoom.state.teamScore;
+  const hostGrant = nextMessage(hostRoom, 'granted');
+  const guestGrant = nextMessage(guestRoom, 'granted');
+  guestRoom.send('presence', { x: second.x, z: second.z, aimX: 1, aimZ: 0, hp: 100, weapon: 0 });
+  const guestAward = await guestGrant;
+  assert(
+    guestAward.by === guestRoom.sessionId,
+    'the award names the second player (seat 1) as the collector'
+  );
+  assert(
+    (await hostGrant).kind === guestAward.kind,
+    'the second player\'s pickup is broadcast to the host as well (shared benefit)'
+  );
+  // Other cubes may legitimately be swept up while this one is collected (the
+  // horde keeps dying around the parked players), so assert the credit is at
+  // least this pickup's worth rather than an exact total.
+  await waitFor(
+    hostRoom,
+    (s) => s.teamScore >= guestScoreBefore + DROP_PICKUP_SCORE,
+    'the second player\'s pickup credited the team score'
+  );
+  assert(
+    hostRoom.state.teamScore >= guestScoreBefore + DROP_PICKUP_SCORE,
+    `the second player's walk-over credited the shared pool (${guestScoreBefore} → ${hostRoom.state.teamScore}, +${hostRoom.state.teamScore - guestScoreBefore})`
+  );
+  await waitFor(hostRoom, (s) => !s.drops.get(String(second.id)), 'the second player removed the drop');
+  await waitFor(
+    guestRoom,
+    (s) => !s.drops.get(String(second.id)),
+    'the second player\'s drop is gone for every client'
+  );
+  assert(
+    !hostRoom.state.drops.get(String(second.id)) && !guestRoom.state.drops.get(String(second.id)),
+    'the second player\'s collected drop left the state for every client'
   );
 
   // --- 4. team score across a restart ------------------------------------
