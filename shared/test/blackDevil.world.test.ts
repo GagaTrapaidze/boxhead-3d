@@ -54,6 +54,12 @@ test('wave 7 spawns the Black Devil first with the standard horde halved', () =>
 function soloBoss(sim: WorldSim) {
   const boss = sim.enemies.find((e) => e.kind === 'blackDevil')!;
   for (const enemy of [...sim.enemies]) if (enemy !== boss) sim.damageEnemy(enemy.id, 1e9, 0, '');
+  // Drop anything already in flight from the boss's spawn-phase AI (a spinner
+  // fired while the horde disgorged). The disgorge loop runs longer on higher
+  // waves, so without this the measured window drifts with the wave's horde
+  // size — the tests must isolate the attack under test, not the setup timing.
+  sim.fireballs.length = 0;
+  sim.shockwaves.length = 0;
   boss.x = 20.5;
   boss.z = 20.5;
   boss.speed = 0; // hold position so the geometry is deterministic
@@ -285,15 +291,9 @@ test('curse is exclusive: exactly one holder, whatever the shockwave sweeps', ()
 
 test('black devil laser: telegraphs, then ticks damage during the beam', () => {
   const sim = simAtBossWave();
-  const boss = sim.enemies.find((e) => e.kind === 'blackDevil')!;
-  for (const enemy of [...sim.enemies]) if (enemy !== boss) sim.damageEnemy(enemy.id, 1e9, 0, '');
-
-  boss.x = 20.5;
-  boss.z = 20.5;
-  boss.attackState = 'idle';
-  boss.laserCooldown = 0;
+  const boss = soloBoss(sim);
+  boss.laserCooldown = 0; // allow the laser
   boss.shockCooldown = 999;
-  boss.fireCooldown = 999;
   sim.syncPlayers([{ id: 'p1', x: 20.5 + 8, z: 20.5, alive: true }]);
   sim.drainEvents();
   sim.drainPlayerDamage();
@@ -313,15 +313,9 @@ test('black devil laser: telegraphs, then ticks damage during the beam', () => {
 
 test('black devil spinner: fires a synchronized orbiting-cube projectile', () => {
   const sim = simAtBossWave();
-  const boss = sim.enemies.find((e) => e.kind === 'blackDevil')!;
-  for (const enemy of [...sim.enemies]) if (enemy !== boss) sim.damageEnemy(enemy.id, 1e9, 0, '');
-
-  boss.x = 20.5;
-  boss.z = 20.5;
-  boss.attackState = 'idle';
-  boss.laserCooldown = 999; // force the spinner branch
+  const boss = soloBoss(sim);
+  boss.fireCooldown = 0; // force the spinner branch
   boss.shockCooldown = 999;
-  boss.fireCooldown = 0;
   sim.syncPlayers([{ id: 'p1', x: 20.5 + 7, z: 20.5, alive: true }]);
 
   sim.step(DT);

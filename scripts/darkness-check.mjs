@@ -1,10 +1,11 @@
 // Darkness / night-wave check — drives the real client UI over CDP.
 //
-// Guards the shared darkness band: from `GAME_CONFIG.DARKNESS_START_WAVE` (6)
-// onward the arena lighting rig eases dark in every mode, waves before it stay
-// bright, and the one-wave `blackout` themed event darkens even an early wave.
-// `nightMode.darkness` is the eased 0..1 factor, so this verifies the smooth
-// transition rather than just a boolean.
+// Guards the shared darkness cadence: darkness is the periodic one-wave
+// `blackout` event, so the rig eases dark on `GAME_CONFIG.DARKNESS_START_WAVE`
+// (6), is bright again on the very next wave (there is no permanent band), and
+// goes dark once more a `WAVE_EVENT_CONFIG.period` later — identical in every
+// mode. `nightMode.darkness` is the eased 0..1 factor, so this verifies the
+// smooth transition rather than just a boolean.
 //
 // Requires the Vite client on http://localhost:5173 and a Chrome on
 // --remote-debugging-port=9333:
@@ -12,6 +13,7 @@
 const DEBUG = process.env.DEBUG_URL || 'http://localhost:9333';
 const CLIENT = process.env.CLIENT_URL || 'http://localhost:5173/';
 const START_WAVE = Number(process.env.DARKNESS_START_WAVE || 6);
+const PERIOD = Number(process.env.WAVE_EVENT_PERIOD || 8);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function connect(url) {
@@ -113,37 +115,34 @@ try {
   );
   assert(started.players === 1, 'solo match started');
 
-  // The wave just before the darkness band stays fully lit.
+  // The wave just before the darkness cadence stays fully lit.
   await page.evaluate(`globalThis.__game_shoot.director.wave = ${START_WAVE - 1}`);
   await sleep(1200);
-  const before = await page.poll(probe, (o) => o.darkness < 0.02, 'daylight before the band');
+  const before = await page.poll(probe, (o) => o.darkness < 0.02, 'daylight before the first dark wave');
   assert(before.active === false, `wave ${START_WAVE - 1} keeps the daylight rig`);
   assert(before.darkness < 0.02, `wave ${START_WAVE - 1} darkness factor is ~0`);
 
-  // Crossing into the band eases the arena dark (never snapped).
+  // The first dark wave eases the arena dark (never snapped).
   await page.evaluate(`globalThis.__game_shoot.director.wave = ${START_WAVE}`);
   const dark = await page.poll(probe, (o) => o.darkness > 0.9, 'night falls');
   assert(dark.active === true, `wave ${START_WAVE} engages the darkness rig`);
   assert(dark.darkness > 0.9, `wave ${START_WAVE} darkness factor eases to ~1`);
   assert(dark.darkness <= 1.0001, 'the darkness factor never exceeds 1');
 
-  // It stays dark on later waves.
-  await page.evaluate(`globalThis.__game_shoot.director.wave = ${START_WAVE + 4}`);
-  await sleep(300);
-  const later = await page.poll(probe, (o) => o.darkness > 0.9, 'darkness persists');
-  assert(later.active === true, `wave ${START_WAVE + 4} stays dark`);
+  // Darkness is a periodic event, not a permanent band: the very next wave is lit.
+  await page.evaluate(`globalThis.__game_shoot.director.wave = ${START_WAVE + 1}`);
+  const next = await page.poll(probe, (o) => o.darkness < 0.02, 'daylight restored on the next wave');
+  assert(next.active === false, `wave ${START_WAVE + 1} is bright — no permanent night band`);
 
-  // The one-wave blackout event darkens an early wave too, then clears.
-  await page.evaluate(
-    `globalThis.__game_shoot.director.wave = ${START_WAVE - 2};
-     globalThis.__game_shoot.director.event = 'blackout';`
-  );
-  const event = await page.poll(probe, (o) => o.darkness > 0.9, 'blackout event');
-  assert(event.active === true, 'the blackout event engages the rig on an early wave');
+  // It returns exactly one `period` later (6 → 14 …).
+  await page.evaluate(`globalThis.__game_shoot.director.wave = ${START_WAVE + PERIOD}`);
+  const repeat = await page.poll(probe, (o) => o.darkness > 0.9, 'the blackout returns');
+  assert(repeat.active === true, `wave ${START_WAVE + PERIOD} is dark again — the event repeats`);
 
-  await page.evaluate(`globalThis.__game_shoot.director.event = 'none'`);
-  const cleared = await page.poll(probe, (o) => o.darkness < 0.02, 'daylight restored');
-  assert(cleared.active === false, 'leaving the dark wave restores full daylight');
+  // ...and clears again on the wave after, so the cadence stays one-wave.
+  await page.evaluate(`globalThis.__game_shoot.director.wave = ${START_WAVE + PERIOD + 1}`);
+  const after = await page.poll(probe, (o) => o.darkness < 0.02, 'daylight restored after the repeat');
+  assert(after.active === false, `wave ${START_WAVE + PERIOD + 1} restores full daylight`);
 
   assert(page.errors.length === 0, `no console errors${page.errors.length ? ` (${JSON.stringify(page.errors)})` : ''}`);
 

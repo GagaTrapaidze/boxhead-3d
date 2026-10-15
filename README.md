@@ -77,9 +77,10 @@ node scripts/online-world-browser-check.mjs   # same requirements as above
 # local 2-player downed → passive revive → Game Over (guards the local rules)
 node scripts/local-revive-check.mjs    # needs dev:client + Chrome on :9333
 
-# darkness band: the arena stays lit below GAME_CONFIG.DARKNESS_START_WAVE (6),
-# eases dark from it on, stays dark on later waves, and the blackout event
-# darkens an early wave — driven over CDP against the real render loop
+# darkness cadence: the arena stays lit below GAME_CONFIG.DARKNESS_START_WAVE
+# (6), eases dark on that wave, is bright again on the next one, and goes dark
+# once more a WAVE_EVENT_CONFIG.period later — driven over CDP against the real
+# render loop
 node scripts/darkness-check.mjs        # needs dev:client + Chrome on :9333
 
 # Red Devil phase-2 charge: a perpendicularly-committed dash steers its heading
@@ -135,10 +136,16 @@ weapons/combo tests check the config directly.
 
 Cross-mode values that must agree between **Solo, local co-op and online** live
 in **`shared/src/gameConfig.ts`** (`GAME_CONFIG`): `DARKNESS_START_WAVE` (the
-wave the night lighting begins and stays on), `BLACK_DEVIL_START_WAVE` (the boss
-encounter) and `SHOCKWAVE_EXPANSION_SPEED`. `balance.config.ts` re-exports them,
-so changing one number there applies to every mode at once — the client lighting
-rig, the offline director and the server world all read the same value.
+first wave darkness falls — darkness IS the periodic one-wave `blackout` event,
+so it hits this wave and then every `WAVE_EVENT_CONFIG.period` waves, 6/14/22 …
+by default; `BLACKOUT_EVENT_WAVE` and `WAVE_EVENT_CONFIG.blackoutOffset` both
+derive from it, so the event and the lighting can never drift apart),
+`BLACK_DEVIL_START_WAVE` (the earliest wave the boss may spawn — a floor; the
+wave that actually hosts the encounter is `DIRECTOR_CONFIG.blackDevilWave` in
+balance.config.ts) and `SHOCKWAVE_EXPANSION_SPEED`. `balance.config.ts`
+re-exports them, so changing one number there applies to every mode at once —
+the client lighting rig, the offline director and the server world all read the
+same value.
 
 `npm test` runs:
 

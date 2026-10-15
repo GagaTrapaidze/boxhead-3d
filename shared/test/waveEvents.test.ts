@@ -2,10 +2,22 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { ENEMY_CONFIG, WAVE_EVENT_CONFIG } from '../src/balance.config.ts';
+import { BLACKOUT_EVENT_WAVE } from '../src/gameConfig.ts';
 import { waveEventFor, waveEventLabel } from '../src/waveEvents.ts';
 
+const { period, speedHordeOffset, blackoutOffset } = WAVE_EVENT_CONFIG;
+
+/** Blackout waves from the configured first wave up to `max`. */
+function blackoutWaves(max: number): number[] {
+  const waves: number[] = [];
+  for (let wave = BLACKOUT_EVENT_WAVE; wave <= max; wave += period) waves.push(wave);
+  return waves;
+}
+
 test('standard waves host no event', () => {
-  for (const wave of [1, 2, 3, 5, 6, 7, 9, 10, 11]) {
+  // Every wave that hosts neither offset is a standard wave.
+  for (let wave = 1; wave <= 32; wave++) {
+    if (wave % period === speedHordeOffset || wave % period === blackoutOffset) continue;
     assert.equal(waveEventFor(wave), 'none', `wave ${wave} is standard`);
   }
   assert.equal(waveEventFor(0), 'none', 'wave 0 is pre-game');
@@ -24,23 +36,29 @@ test('speed-horde waves: 4, 12, 20 … — runners only at +80% speed, 40 HP', (
   assert.equal(ENEMY_CONFIG.runner.hp, 40, 'speed-horde runners keep their lightweight 40 HP');
 });
 
-test('blackout waves: 8, 16, 24 … — lights-out between events', () => {
-  for (const wave of [8, 16, 24, 32]) {
+test('blackout waves start at BLACKOUT_EVENT_WAVE and repeat every `period`', () => {
+  const waves = blackoutWaves(32);
+  assert.equal(waves[0], BLACKOUT_EVENT_WAVE, 'the first blackout is the configured wave');
+  for (const wave of waves) {
     assert.equal(waveEventFor(wave), 'blackout', `wave ${wave} is a blackout`);
   }
+  assert.ok(waveEventFor(BLACKOUT_EVENT_WAVE - 1) !== 'blackout', 'none before the first');
 });
 
-test('events interleave every 4 waves and never repeat back-to-back', () => {
+test('speed horde and blackout events never collide on the same wave', () => {
+  assert.notEqual(speedHordeOffset, blackoutOffset, 'the two events must use different offsets');
   const eventWaves: number[] = [];
   for (let wave = 1; wave <= 32; wave++) {
     if (waveEventFor(wave) !== 'none') eventWaves.push(wave);
   }
-  assert.deepEqual(eventWaves, [4, 8, 12, 16, 20, 24, 28, 32]);
-  // alternate: speed → blackout → speed → blackout …
-  assert.equal(waveEventFor(4), 'speedHorde');
-  assert.equal(waveEventFor(8), 'blackout');
-  assert.equal(waveEventFor(12), 'speedHorde');
-  assert.equal(waveEventFor(16), 'blackout');
+  for (const wave of eventWaves) {
+    const isSpeed = wave % period === speedHordeOffset;
+    const isBlackout = wave % period === blackoutOffset;
+    assert.ok(isSpeed !== isBlackout, `wave ${wave} hosts exactly one event`);
+  }
+  for (const wave of [4, 12, 20, 28]) {
+    assert.ok(eventWaves.includes(wave), `wave ${wave} hosts the speed horde`);
+  }
 });
 
 test('event labels drive the HUD banner', () => {

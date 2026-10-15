@@ -1,9 +1,10 @@
 /**
  * Darkness / night-wave lighting.
  *
- * From `GAME_CONFIG.DARKNESS_START_WAVE` (shared/src/gameConfig.ts) onward the
- * arena stays dark in every mode — Solo, local co-op and online — and from a
- * themed blackout event the same rig runs even darker for its single wave. The
+ * Darkness is the periodic one-wave `blackout` event: the rig eases dark on
+ * `GAME_CONFIG.DARKNESS_START_WAVE` and on every `WAVE_EVENT_CONFIG.period`
+ * waves after it (gameConfig.ts / balance.config.ts), in every mode — Solo,
+ * local co-op and online — and the arena is bright in between. The
  * ambient and directional lights ease down, a night fog closes in, and every
  * player carries a flashlight: a THREE.SpotLight cone aimed along their current
  * facing. Zombies stay hidden in the dark until they walk into a cone — or are

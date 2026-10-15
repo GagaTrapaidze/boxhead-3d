@@ -32,7 +32,7 @@
  *  - `explosionRadius` is the AoE blast radius.
  */
 
-import { GAME_CONFIG } from './gameConfig.ts';
+import { BLACKOUT_EVENT_WAVE, GAME_CONFIG } from './gameConfig.ts';
 
 export interface WeaponBalance {
   name: string;
@@ -745,7 +745,7 @@ export const ENEMY_CONFIG: EnemyBalance = {
   //  A3 telegraphed purple tracking laser (1 s telegraph + 3.5 s channel).
   blackDevil: {
     hp: 1200,
-    speed: 1.6,
+    speed: 1.8,
     damage: 20,
     // ~1.5× the red Devil's rendered body (0.7 u × 1.15 scale ⇒ ~1.05 u here).
     radius: 1.05,
@@ -760,10 +760,10 @@ export const ENEMY_CONFIG: EnemyBalance = {
     spinnerRangeMin: 3,
     spinnerRangeMax: 13,
     spinnerSpinRate: 9,
-    shockwaveRadius: 4,
+    shockwaveRadius: 14,
     shockwaveDamage: 25,
     shockwaveCooldown: 4.5,
-    shockwaveTriggerRange: 3,
+    shockwaveTriggerRange: 15,
     // 4 u ring at 8 u/s: a 0.5 s window to break line-of-sight behind cover.
     shockwaveExpansionSpeed: SHOCKWAVE_EXPANSION_SPEED,
     shockwaveRingThickness: 0.5,
@@ -778,7 +778,7 @@ export const ENEMY_CONFIG: EnemyBalance = {
     laserRange: 24,
     laserHalfWidth: 0.7,
     // Slack enough that a sprinting/strafe-dodging player can out-run the turn.
-    laserTurnRate: 0.5,
+    laserTurnRate: 0.7,
     laserDamage: 10,
     laserTickInterval: 0.25,
     lootDropMin: 3,
@@ -852,23 +852,37 @@ export interface WaveEventBalance {
   period: number;
   /** Speed-horde waves sit at `wave % period === speedHordeOffset` (4, 12, …). */
   speedHordeOffset: number;
-  /** Blackout waves sit at `wave % period === blackoutOffset` (8, 16, …). */
+  /** Blackout waves sit at `wave % period === blackoutOffset`. `blackoutOffset`
+   * is derived from `GAME_CONFIG.DARKNESS_START_WAVE`, so the first blackout
+   * wave — and with it the darkness itself — is set by that one number, and
+   * later blackouts repeat every `period` waves. */
   blackoutOffset: number;
   /** Extra movement speed for a speed-horde runner (+0.8 = +80%). */
   runnerSpeedBonus: number;
 }
 
+/** Wave-event cadence period: an event wave every `period` waves. */
+const WAVE_EVENT_PERIOD = 8;
+
+/**
+ * Special wave cadence. `blackoutOffset` is DERIVED from
+ * `GAME_CONFIG.DARKNESS_START_WAVE` (gameConfig.ts) rather than hardcoded here,
+ * so editing the one darkness number moves the blackout event — and with it the
+ * darkness itself — in Solo, local co-op and online at once.
+ */
 export const WAVE_EVENT_CONFIG: WaveEventBalance = {
-  period: 8,
+  period: WAVE_EVENT_PERIOD,
   speedHordeOffset: 4, // waves 4, 12, 20 …
-  blackoutOffset: 0, // waves 8, 16, 24 … (wave % 8 === 0)
+  blackoutOffset: BLACKOUT_EVENT_WAVE % WAVE_EVENT_PERIOD, // 6, 14, 22 … by default
   runnerSpeedBonus: 0.8,
 };
 
 /**
- * Absolute floor for the Black Devil encounter. The boss may never spawn before
- * this wave, even if `blackDevilWave` is ever misconfigured. Derived from
- * `GAME_CONFIG.BLACK_DEVIL_START_WAVE` so the whole encounter moves with one edit.
+ * Absolute floor for the Black Devil encounter: the boss may never spawn before
+ * this wave, even if `DIRECTOR_CONFIG.blackDevilWave` is set lower (the client
+ * director and the server world both clamp with `Math.max`). Derived from
+ * `GAME_CONFIG.BLACK_DEVIL_START_WAVE` — lower that value too if you want the
+ * encounter to be allowed earlier than wave 7.
  */
 export const BLACK_DEVIL_MIN_WAVE = GAME_CONFIG.BLACK_DEVIL_START_WAVE;
 
@@ -886,7 +900,14 @@ export const DIRECTOR_CONFIG: DirectorBalance = {
   runnerFromWave: 2,
   devilFromWave: 3,
   maxDevils: 4,
-  blackDevilWave: GAME_CONFIG.BLACK_DEVIL_START_WAVE,
+  /**
+   * Wave that hosts the Black Devil encounter — EDIT THIS NUMBER to move the
+   * boss (e.g. `9`). A plain value, deliberately no longer derived from
+   * GAME_CONFIG, so the encounter is tuned here alongside the rest of the
+   * director balance. It is clamped up to `BLACK_DEVIL_MIN_WAVE`, so the boss
+   * can never spawn below that floor.
+   */
+  blackDevilWave: 7,
   blackDevilMobCountMultiplier: 0.5,
   /** Last-ditch sprint: no downtime once the wave is nearly cleared. */
   enrageThreshold: 3,

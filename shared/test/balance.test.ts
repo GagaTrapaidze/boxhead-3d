@@ -20,6 +20,7 @@ import {
   WAVE_CONFIG,
   WAVE_EVENT_CONFIG,
 } from '../src/balance.config.ts';
+import { BLACKOUT_EVENT_WAVE } from '../src/gameConfig.ts';
 
 test('grenade vs the Devil boss: exactly two direct explosions from full HP', () => {
   const { hp, explosiveDamageCap } = ENEMY_CONFIG.devil;
@@ -120,10 +121,14 @@ test('wooden crates: 150 HP fortifications that never detonate', () => {
     'crates unlock before explosive barrels');
 });
 
-test('special wave events: speed horde at 4/12…, blackout at 8/16…', () => {
+test('special wave events: speed horde at 4/12…, blackout at 6/14…', () => {
   assert.equal(WAVE_EVENT_CONFIG.period, 8);
   assert.equal(WAVE_EVENT_CONFIG.speedHordeOffset, 4);
-  assert.equal(WAVE_EVENT_CONFIG.blackoutOffset, 0);
+  assert.equal(
+    WAVE_EVENT_CONFIG.blackoutOffset,
+    BLACKOUT_EVENT_WAVE % WAVE_EVENT_CONFIG.period,
+    'the blackout wave is set by the darkness wave (gameConfig.ts)'
+  );
   assert.equal(WAVE_EVENT_CONFIG.runnerSpeedBonus, 0.8, 'speed-horde runners move +80%');
   // widened so the guard still typechecks if the config values are edited equal
   const offsets: number[] = [WAVE_EVENT_CONFIG.speedHordeOffset, WAVE_EVENT_CONFIG.blackoutOffset];

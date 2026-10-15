@@ -26,7 +26,6 @@ import {
   JUICE_CONFIG,
   WAVE_CONFIG,
 } from '../../shared/src/balance.config.ts';
-import { darknessActive } from '../../shared/src/gameConfig.ts';
 import { advanceRevive, isInReviveCircle } from '../../shared/src/revive.ts';
 import {
   CURSE_CLEANSE_SECONDS,
@@ -35,7 +34,7 @@ import {
   curseProgress,
   isInCurseCircle,
 } from '../../shared/src/curse.ts';
-import { waveEventLabel } from '../../shared/src/waveEvents.ts';
+import { darknessActive, waveEventLabel } from '../../shared/src/waveEvents.ts';
 import type { WaveEventKind } from '../../shared/src/waveEvents.ts';
 
 import { createWorld, loadMap, resizeWorld, updateSpawnGateWarnings } from './game/world.ts';
@@ -1979,12 +1978,12 @@ function update(dt: number, nowMs: number): void {
     }
   }
 
-  // Darkness / night lighting: from GAME_CONFIG.DARKNESS_START_WAVE onward the
-  // arena stays dim and every player carries a flashlight (the themed blackout
-  // event keeps its own darker, one-wave treatment). Same rule in Solo, local
-  // co-op and online — `director.wave` is the local director offline and the
-  // room-mirrored wave online. `NightMode` eases in/out, so a restart restores
-  // full daylight.
+  // Darkness / night lighting: the arena goes dark exactly on the periodic
+  // `blackout` waves (the first is GAME_CONFIG.DARKNESS_START_WAVE, then one
+  // every WAVE_EVENT_CONFIG.period waves) and is bright in between — there is
+  // no permanent night band. Same rule in Solo, local co-op and online —
+  // `director.wave` is the local director offline and the room-mirrored wave
+  // online. `NightMode` eases in/out, so a restart restores full daylight.
   nightMode.setActive(darknessActive(director.wave, director.event === 'blackout'));
   nightMode.update(dt, players);
 
