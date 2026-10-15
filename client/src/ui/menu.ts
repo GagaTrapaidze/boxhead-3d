@@ -7,6 +7,7 @@
 import { DEFAULT_MAP_ID, MAP_DEFINITIONS } from '../../../shared/src/maps.ts';
 import type { MapDefinition } from '../../../shared/src/maps.ts';
 import { MAX_PLAYERS } from '../../../shared/src/constants.ts';
+import { getGraphicsQuality, setGraphicsQuality } from '../game/graphics.ts';
 import { SERVER_URL } from '../network/serverUrl.ts';
 import type { ConnectionState, RoomInfo } from '../network/lobby.ts';
 
@@ -69,6 +70,29 @@ function setActiveLayout(mode: StartMode): void {
   byId('ctrlP2').classList.toggle('active', mode === 'duo');
 }
 
+/**
+ * Paints the pre-game graphics toggle to match the stored HIGH/LOW mode. The
+ * whole pill is one `<button>` with `role="switch"`, so click and Enter/Space
+ * both flip it.
+ */
+function reflectGraphicsQuality(): void {
+  const quality = getGraphicsQuality();
+  byId<HTMLButtonElement>('graphicsToggle').setAttribute(
+    'aria-checked',
+    quality === 'HIGH' ? 'true' : 'false'
+  );
+  byId('graphicsValue').textContent = quality;
+}
+
+/** Wires the graphics toggle: flips the persisted mode and repaints the scene. */
+function initGraphicsToggle(): void {
+  byId<HTMLButtonElement>('graphicsToggle').addEventListener('click', () => {
+    setGraphicsQuality(getGraphicsQuality() === 'HIGH' ? 'LOW' : 'HIGH');
+    reflectGraphicsQuality();
+  });
+  reflectGraphicsQuality();
+}
+
 /** Repaints the selected-state ring on every map card. */
 function reflectSelectedMap(): void {
   document.querySelectorAll<HTMLButtonElement>('.mapCard').forEach((card) => {
@@ -124,6 +148,7 @@ function buildMapCards(): void {
 
 export function initMenu(handlers: MenuHandlers): void {
   buildMapCards();
+  initGraphicsToggle();
   const onlinePanel = byId('onlinePanel');
   const onlineNote = byId('onlineNote');
   const playerName = byId<HTMLInputElement>('playerName');

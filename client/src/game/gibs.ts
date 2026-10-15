@@ -8,6 +8,7 @@
 import * as THREE from 'three';
 
 import { JUICE_CONFIG } from '../../../shared/src/balance.config.ts';
+import { isLowQuality } from './graphics.ts';
 
 /** White bone/flesh debris. */
 const GIB_COLOR_LIGHT = 0xd8dde8;
@@ -50,9 +51,11 @@ export class GibLayer {
 
   /** Spawns `count` cubes at a world position with random outward velocity. */
   burst(x: number, z: number, count: number): void {
+    // LOW quality: halve the splatter (never below a single readable cube).
+    const budget = isLowQuality() ? Math.max(1, Math.ceil(count / 2)) : count;
     let spawned = 0;
     for (const gib of this.gibs) {
-      if (spawned >= count) break;
+      if (spawned >= budget) break;
       if (gib.life > 0) continue;
       this.launch(gib, x, z);
       spawned++;

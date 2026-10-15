@@ -8,6 +8,7 @@
 import * as THREE from 'three';
 
 import { FX_CONFIG } from '../../../shared/src/balance.config.ts';
+import { isLowQuality } from './graphics.ts';
 
 export const TRACER_LIFE = FX_CONFIG.tracerLife;
 export const MUZZLE_FLASH_LIFE = FX_CONFIG.muzzleFlashLife;
@@ -40,6 +41,8 @@ export class FxLayer {
   private readonly flashGeometry = new THREE.SphereGeometry(1, 8, 6);
   private readonly muzzleLight: THREE.PointLight;
   private lightLife = 0;
+  /** Alternating counter that halves wall-spark bursts in LOW quality. */
+  private impactTick = 0;
 
   constructor(private readonly scene: THREE.Scene) {
     for (let i = 0; i < TRACER_POOL_SIZE; i++) {
@@ -103,14 +106,19 @@ export class FxLayer {
     flash.life = MUZZLE_FLASH_LIFE;
     flash.scale = scale;
 
-    this.muzzleLight.color.setHex(color);
-    this.muzzleLight.position.set(x, y + 0.2, z);
-    this.muzzleLight.intensity = scale * 2.2;
-    this.lightLife = MUZZLE_FLASH_LIFE;
+    // LOW quality: dynamic lighting is off — keep the mesh flash, skip the light.
+    if (!isLowQuality()) {
+      this.muzzleLight.color.setHex(color);
+      this.muzzleLight.position.set(x, y + 0.2, z);
+      this.muzzleLight.intensity = scale * 2.2;
+      this.lightLife = MUZZLE_FLASH_LIFE;
+    }
   }
 
   /** Spawns a small spark burst where a bullet struck a wall. */
   impact(x: number, z: number, color = 0xffe6a0, y = 0.8): void {
+    // LOW quality: thin the wall-spark bursts to every other impact.
+    if (isLowQuality() && this.impactTick++ % 2 === 1) return;
     const impact = this.impacts.find((candidate) => candidate.life <= 0) ?? this.impacts[0];
     impact.mesh.position.set(x, y, z);
     impact.mesh.material.color.setHex(color);

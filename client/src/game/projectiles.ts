@@ -9,6 +9,7 @@ import * as THREE from 'three';
 
 import { GridMap } from '../../../shared/src/grid.ts';
 import { buildFireballMesh, buildGrenadeMesh, buildRocketMesh, buildSpinnerMesh } from './actors.ts';
+import { isLowQuality } from './graphics.ts';
 import type { WeaponDef } from '../../../shared/src/weapons.ts';
 import { GRENADE_CONFIG, ENEMY_CONFIG, FX_CONFIG, PHYSICS_CONFIG } from '../../../shared/src/balance.config.ts';
 
@@ -422,7 +423,8 @@ export function updateProjectiles(
     flash.mesh.scale.setScalar(0.5 + progress * flash.maxScale);
     const material = flash.mesh.material as THREE.MeshBasicMaterial;
     material.opacity = Math.max(0, 0.85 * (1 - progress));
-    flash.light.intensity = flash.maxScale * 9 * Math.max(0, 1 - progress);
+    // LOW quality: the blast light is muted (the mesh flash still reads clearly).
+    flash.light.intensity = isLowQuality() ? 0 : flash.maxScale * 9 * Math.max(0, 1 - progress);
     if (flash.life <= 0) {
       scene.remove(flash.mesh, flash.light);
       material.dispose(); // geometry is shared across all flashes

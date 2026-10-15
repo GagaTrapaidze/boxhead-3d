@@ -39,6 +39,7 @@ import type { WaveEventKind } from '../../shared/src/waveEvents.ts';
 
 import { createWorld, loadMap, resizeWorld, updateSpawnGateWarnings } from './game/world.ts';
 import type { World } from './game/world.ts';
+import { applyGraphicsQuality, registerGraphicsWorld } from './game/graphics.ts';
 import { DEFAULT_MAP_ID, getMap } from '../../shared/src/maps.ts';
 import type { MapDefinition } from '../../shared/src/maps.ts';
 import { CameraController } from './game/camera.ts';
@@ -133,6 +134,8 @@ interface Mine {
 }
 
 const world: World = createWorld(byId('app'));
+// Bind the scene to the persisted graphics mode (HIGH/LOW) and apply it now.
+registerGraphicsWorld(world);
 
 // HUD
 const hud = byId('hud');
@@ -485,6 +488,10 @@ function startGame(selectedMode: StartMode, mapId: string = lastMapId): void {
       : { x: (spawns[0].x + spawns[1].x) / 2, z: (spawns[0].y + spawns[1].y) / 2 };
   cameraRig = new CameraController(world, mode === 'single' ? 'single' : 'duo', center);
 
+  // Apply the persisted graphics mode now that this match's arena and actors
+  // exist, so LOW clears their shadow flags too (HIGH restores them).
+  applyGraphicsQuality(world);
+
   hud.hidden = false;
   card2.root.hidden = mode !== 'duo';
   mult2.hidden = mode !== 'duo';
@@ -778,6 +785,10 @@ function startOnlineMatch(info: RoomInfo): void {
   syncRemotePlayers(info);
 
   cameraRig = new CameraController(world, 'duo', centroidOf([...players, ...remotePlayers]));
+
+  // Apply the persisted graphics mode now that the arena and every peer actor
+  // exist, so LOW clears their shadow flags too (HIGH restores them).
+  applyGraphicsQuality(world);
 
   hud.hidden = false;
   card2.root.hidden = true;
