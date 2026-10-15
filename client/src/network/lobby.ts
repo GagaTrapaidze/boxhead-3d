@@ -162,6 +162,23 @@ export interface PropDestroyedEvent {
   cz: number;
 }
 
+/**
+ * A shot fired by a peer. The room relays it (except back to the shooter), and
+ * every other client replays the same lightweight visual tracer, muzzle flash
+ * and gunshot from the shooter's weapon position — no server entity is created.
+ */
+export interface PlayerShootEvent {
+  /** Weapon position the shot originated from (world units, y = barrel height). */
+  origin: { x: number; y: number; z: number };
+  /** Aim direction on the ground plane (normalized by the client on receipt). */
+  direction: { x: number; y: number; z: number };
+  /** `WeaponId` wire code (see shared/src/weapons.ts). */
+  weaponType: number;
+}
+
+/** Payload this client sends when it fires; the room relays it to its peers. */
+export type PlayerShootMessage = PlayerShootEvent;
+
 /** A stable snapshot of the room the UI and game loop can read. */
 export interface RoomInfo {
   /** 6-char shareable room code. */
@@ -221,10 +238,13 @@ export interface LobbyHandlers {
   onExplosion: (event: ExplosionEvent) => void;
   /** The boss fired a radial shockwave — play the ring + subtle screen shake. */
   onShockwave: (event: ShockwaveEvent) => void;
+  /** A peer fired a shot — replay its tracer, muzzle flash and gunshot. */
+  onPlayerShoot: (event: PlayerShootEvent) => void;
   /** The server dealt damage to this client's player (melee / hazard / blast). */
   onDamagePlayer: (amount: number) => void;
-  /** A walk-over pickup was granted by the server (broadcast to every client,
-   * so both players receive the shared loot benefit). `by` = collector. */
+  /** A walk-over pickup was granted to THIS client by the server (the room
+   * awards only the collector, so a drop never lands in a teammate's
+   * inventory). `by` = collector's sessionId. */
   onGranted: (kind: DropKind, by: string) => void;
   /** A new wave started (banner + toast). */
   onWaveStart: (wave: number, event: WaveEventKind) => void;
@@ -471,6 +491,15 @@ export class Lobby {
   }
 
   /**
+   * Relays a shot this client just fired so every OTHER client replays its
+   * tracer, muzzle flash and gunshot. Cosmetic only: the room spawns no entity
+   * for it (`performance` requirement — fast bullets stay visual tracers).
+   */
+  sendPlayerShoot(shot: PlayerShootMessage): void {
+    this.room?.send('playerShoot', shot);
+  }
+
+  /**
    * Relays this client's transform to the room. Throttled to 20 Hz internally,
    * so the game loop can call it every frame.
    */
@@ -542,6 +571,17 @@ export class Lobby {
     room.onMessage('damagePlayer', (msg: { amount: number }) => {
       this.handlers.onDamagePlayer(msg.amount);
     });
+    room.onMessage(
+      'playerShoot',
+      (msg: { origin?: { x: number; y: number; z: number }; direction?: { x: number; y: number; z: number }; weaponType?: number }) => {
+        if (!msg?.origin || !msg?.direction) return; // ignore a malformed relay
+        this.handlers.onPlayerShoot({
+          origin: { x: msg.origin.x, y: msg.origin.y, z: msg.origin.z },
+          direction: { x: msg.direction.x, y: msg.direction.y, z: msg.direction.z },
+          weaponType: msg.weaponType ?? 0,
+        });
+      }
+    );
     room.onMessage('granted', (msg: { kind: number; by?: string }) => {
       this.handlers.onGranted(dropKindFromCode(msg.kind), msg.by ?? '');
     });

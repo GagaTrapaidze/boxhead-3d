@@ -32,6 +32,8 @@
  *  - `explosionRadius` is the AoE blast radius.
  */
 
+import { GAME_CONFIG } from './gameConfig.ts';
+
 export interface WeaponBalance {
   name: string;
   kind: 'hitscan' | 'projectile' | 'deployable';
@@ -664,10 +666,11 @@ export interface BlackDevilBalance extends DevilBalance {
  *
  * This is THE knob for Attack 2's travel time: the ring races outward at this
  * exact speed on both the server authority and the offline client AI, so the
- * reaction window (dodge or reach cover) is identical in every mode. Exposed as
- * a standalone constant because it is the single most-tuned boss value.
+ * reaction window (dodge or reach cover) is identical in every mode. It is
+ * re-exported from `GAME_CONFIG` (shared/src/gameConfig.ts) so the one number
+ * there tunes the shockwave in Solo, local co-op and online alike.
  */
-export const SHOCKWAVE_EXPANSION_SPEED = 10;
+export const SHOCKWAVE_EXPANSION_SPEED = GAME_CONFIG.SHOCKWAVE_EXPANSION_SPEED;
 
 export interface EnemyBalance {
   walker: ZombieBalance;
@@ -756,7 +759,7 @@ export const ENEMY_CONFIG: EnemyBalance = {
     shockwaveDamage: 25,
     shockwaveCooldown: 4.5,
     shockwaveTriggerRange: 3,
-    // 4 u ring at 12 u/s: a 0.33 s window to break line-of-sight behind cover.
+    // 4 u ring at 8 u/s: a 0.5 s window to break line-of-sight behind cover.
     shockwaveExpansionSpeed: SHOCKWAVE_EXPANSION_SPEED,
     shockwaveRingThickness: 0.5,
     // Curse: 5 HP/second until cleansed by a teammate's 3 s hold in the 2 u zone.
@@ -850,16 +853,16 @@ export interface WaveEventBalance {
 export const WAVE_EVENT_CONFIG: WaveEventBalance = {
   period: 8,
   speedHordeOffset: 4, // waves 4, 12, 20 …
-  blackoutOffset: 6, // waves 8, 16, 24 …
+  blackoutOffset: 0, // waves 8, 16, 24 … (wave % 8 === 0)
   runnerSpeedBonus: 0.8,
 };
 
 /**
  * Absolute floor for the Black Devil encounter. The boss may never spawn before
- * this wave, even if `blackDevilWave` is ever misconfigured — waves 1–6 always
- * field only the standard horde.
+ * this wave, even if `blackDevilWave` is ever misconfigured. Derived from
+ * `GAME_CONFIG.BLACK_DEVIL_START_WAVE` so the whole encounter moves with one edit.
  */
-export const BLACK_DEVIL_MIN_WAVE = 7;
+export const BLACK_DEVIL_MIN_WAVE = GAME_CONFIG.BLACK_DEVIL_START_WAVE;
 
 export const DIRECTOR_CONFIG: DirectorBalance = {
   openingIntermission: 4,
@@ -875,7 +878,7 @@ export const DIRECTOR_CONFIG: DirectorBalance = {
   runnerFromWave: 2,
   devilFromWave: 3,
   maxDevils: 4,
-  blackDevilWave: 7,
+  blackDevilWave: GAME_CONFIG.BLACK_DEVIL_START_WAVE,
   blackDevilMobCountMultiplier: 0.5,
   /** Last-ditch sprint: no downtime once the wave is nearly cleared. */
   enrageThreshold: 3,

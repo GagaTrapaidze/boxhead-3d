@@ -254,7 +254,7 @@ try {
     `both tabs display the same score (${hostScore.hud} / ${guestScore.hud})`
   );
 
-  // Walking the host onto a drop must grant it (shared benefit) and credit the
+  // Walking the host onto a drop must award it to the host alone and credit the
   // shared pool on BOTH clients, and the cube must vanish from both worlds.
   await host.focus();
   const drop = JSON.parse(await host.evaluate(`JSON.stringify(globalThis.__game_shoot.dropPoints[0])`));

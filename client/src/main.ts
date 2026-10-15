@@ -10,7 +10,7 @@
  */
 import * as THREE from 'three';
 
-import { WeaponId, getWeapon, hasAmmo, isReadyToFire } from '../../shared/src/weapons.ts';
+import { WEAPONS, WeaponId, getWeapon, hasAmmo, isReadyToFire } from '../../shared/src/weapons.ts';
 import {
   comboMilestoneLabel,
   comboWindowSeconds,
@@ -26,6 +26,7 @@ import {
   JUICE_CONFIG,
   WAVE_CONFIG,
 } from '../../shared/src/balance.config.ts';
+import { darknessActive } from '../../shared/src/gameConfig.ts';
 import { advanceRevive, isInReviveCircle } from '../../shared/src/revive.ts';
 import {
   CURSE_CLEANSE_SECONDS,
@@ -113,7 +114,7 @@ import {
 } from './ui/menu.ts';
 import type { MatchSummary, PlayerSummary, StartMode } from './ui/menu.ts';
 import { Lobby } from './network/lobby.ts';
-import type { OnlinePlayer, RoomInfo } from './network/lobby.ts';
+import type { OnlinePlayer, PlayerShootEvent, RoomInfo } from './network/lobby.ts';
 import { OnlineWorld } from './network/onlineWorld.ts';
 import type { OnlineWorldContext } from './network/onlineWorld.ts';
 import { weaponIconSvg } from './ui/weaponIcons.ts';
@@ -381,6 +382,20 @@ function shotSound(weaponId: number): void {
   if (weaponId === WeaponId.Shotgun) audio.shotgun();
   else if (weaponId === WeaponId.Uzi) audio.uzi();
   else audio.pistol();
+}
+
+/** Height the pooled tracer line flies at (shared by the local and remote shot). */
+const FX_TRACER_Y = 0.7;
+
+/**
+ * Muzzle-flash size for a weapon. One source of truth shared by the local shot
+ * and the remote-shot replay, so both clients show the identical pop.
+ */
+function muzzleScaleFor(weaponId: number): number {
+  if (weaponId === WeaponId.Shotgun) return 1.6;
+  if (weaponId === WeaponId.Uzi) return 0.6;
+  if (getWeapon(weaponId).kind === 'projectile') return 1.1;
+  return 0.8;
 }
 
 function flashDamage(): void {
@@ -865,6 +880,7 @@ function createLobby(): Lobby {
     },
     onExplosion: (event) => handleServerExplosion(event.x, event.z, event.radius),
     onShockwave: (event) => handleBossShockwave(event.x, event.z, event.radius, event.speed),
+    onPlayerShoot: (event) => handleRemoteShot(event),
     onDamagePlayer: (amount) => {
       const local = players[0];
       if (local) applyDamage(local, amount);
@@ -872,17 +888,19 @@ function createLobby(): Lobby {
     onGranted: (kind, by) => {
       const local = players[0];
       if (!local) return;
+      // Pickup isolation: the room sends `granted` only to the player who walked
+      // the cube over. Guard regardless, so a stray broadcast can never hand a
+      // teammate's grenade / weapon to this player's inventory.
+      if (by && onlineInfo?.selfId && by !== onlineInfo.selfId) return;
       audio.pickup();
-      // The room broadcasts every pickup to BOTH clients and each one applies
-      // it to its own player, so loot is a shared co-op benefit.
+      // This client is the collector — the drop lands in OUR inventory only.
       const message = applyPickup(local, kind);
       if (local.weapon !== local._lastWeaponId) {
         updateWeaponMesh(local.mesh, local.weapon);
         local._lastWeaponId = local.weapon;
       }
-      const collector =
-        by && by !== onlineInfo?.selfId ? onlineInfo?.players.find((p) => p.sessionId === by) : null;
-      toast(`${collector?.name ?? local.character}: ${message}`, 2);
+      const me = onlineInfo?.players.find((p) => p.sessionId === onlineInfo?.selfId);
+      toast(`${me?.name ?? local.character}: ${message}`, 2);
     },
     onWaveStart: (wave, event) => handleRemoteWaveStart(wave, event),
     onWaveClear: (wave) => handleRemoteWaveClear(wave),
@@ -953,6 +971,62 @@ function handleServerExplosion(x: number, z: number, radius: number): void {
     currentProjectileWorld()
   );
   cameraRig?.addTrauma(JUICE_CONFIG.barrelChainTrauma);
+}
+
+/**
+ * A peer fired a shot — replay the identical lightweight visuals here: the
+ * pooled tracer line(s), the muzzle flash and the weapon's gunshot, all
+ * originating from the shooter's weapon position along the reported direction.
+ *
+ * Fast bullets stay pure visuals: we re-run the shared hitscan against our
+ * mirrored world so the tracer stops on the same wall / mob, but we never spawn
+ * a physics entity or apply damage (the room owns the actual hit).
+ */
+function handleRemoteShot(event: PlayerShootEvent): void {
+  if (!isOnline || phase !== 'playing') return;
+
+  // Unknown weapon id (guards a corrupted relay) — nothing sensible to draw.
+  if (event.weaponType < 0 || event.weaponType >= WEAPONS.length) return;
+  const def = getWeapon(event.weaponType);
+
+  const originX = event.origin.x;
+  const originZ = event.origin.z;
+  const originY = Number.isFinite(event.origin.y) ? event.origin.y : FX_TRACER_Y;
+
+  let dirX = event.direction.x;
+  let dirZ = event.direction.z;
+  const length = Math.hypot(dirX, dirZ);
+  if (length < 1e-4) return; // no aim → nothing to draw
+  dirX /= length;
+  dirZ /= length;
+
+  const color = def.tracerColor;
+
+  if (def.kind === 'hitscan') {
+    const targets = horde.zombies.map((zombie) => ({
+      x: zombie.x,
+      z: zombie.z,
+      radius: zombie.radius,
+    }));
+    const result = fireHitscan(originX, originZ, dirX, dirZ, def, targets, world.grid);
+    for (const pellet of result.pellets) {
+      fx.tracer(originX, originZ, pellet.x, pellet.z, color, originY);
+      if (pellet.hitWall) fx.impact(pellet.x, pellet.z, color, originY + 0.1);
+    }
+  }
+
+  // Muzzle flash for anything that fires (hitscan or projectile); deployables
+  // (barrel / crate / mine) only play their click, exactly as they do locally.
+  if (def.kind !== 'deployable') {
+    fx.muzzleFlash(
+      originX + dirX * 0.5,
+      originZ + dirZ * 0.5,
+      muzzleScaleFor(event.weaponType),
+      color,
+      originY + 0.2
+    );
+  }
+  shotSound(event.weaponType);
 }
 
 /** Reports a blast this client resolved; the room owns its damage and chains. */
@@ -1145,6 +1219,17 @@ function tryFire(player: Player, nowMs: number): void {
   if (def.magSize > 0) player.ammo.set(weaponId, (player.ammo.get(weaponId) ?? 0) - 1);
   const power = player.powerTimer > 0 ? 2 : 1;
 
+  // Tell the room we fired so every OTHER client replays the same tracer,
+  // muzzle flash and gunshot. Cosmetic only: the shot's damage travels through
+  // `damageEnemy` / `damageProp` / `explode`, and no server entity is spawned.
+  if (isOnline) {
+    onlineLobby?.sendPlayerShoot({
+      origin: { x: player.x, y: FX_TRACER_Y, z: player.z },
+      direction: { x: player.aimX, y: 0, z: player.aimZ },
+      weaponType: weaponId,
+    });
+  }
+
   if (def.kind === 'hitscan') {
     player.shotsFired += 1;
     const targets = horde.zombies.map((zombie) => ({
@@ -1172,8 +1257,7 @@ function tryFire(player: Player, nowMs: number): void {
 
     // chunky muzzle flash for the shotgun, a tight one for the uzi,
     // a light single pop for the pistol
-    const muzzleScale =
-      weaponId === WeaponId.Shotgun ? 1.6 : weaponId === WeaponId.Uzi ? 0.6 : 0.8;
+    const muzzleScale = muzzleScaleFor(weaponId);
     fx.muzzleFlash(
       player.x + player.aimX * 0.5,
       player.z + player.aimZ * 0.5,
@@ -1307,7 +1391,12 @@ function tryFire(player: Player, nowMs: number): void {
   if (def.kind === 'projectile') {
     player.shotsFired += 1;
     const kind = weaponId === WeaponId.Grenade ? 'grenade' : 'rocket';
-    fx.muzzleFlash(player.x + player.aimX * 0.5, player.z + player.aimZ * 0.5, 1.1, def.tracerColor);
+    fx.muzzleFlash(
+      player.x + player.aimX * 0.5,
+      player.z + player.aimZ * 0.5,
+      muzzleScaleFor(weaponId),
+      def.tracerColor
+    );
     spawnPlayerProjectile(
       world.scene,
       projectiles,
@@ -1561,6 +1650,10 @@ function damageZombie(
  * schema, so this is skipped there.
  */
 function updateLocalCurses(dt: number): void {
+  // Strict multiplayer-only rule: the curse (and its circle / teammate cleanse)
+  // exists only while at least two players share the match. In Solo the
+  // shockwave deals direct damage only, so this whole loop stays inert.
+  if (players.length < 2) return;
   for (const player of players) {
     if (!player.cursed && !player.curse) continue;
     // A downed player's curse lapses with the run — no ticking through death.
@@ -1886,8 +1979,13 @@ function update(dt: number, nowMs: number): void {
     }
   }
 
-  // blackout / night-wave lighting: dim the arena, aim each player's flashlight
-  nightMode.setActive(director.event === 'blackout');
+  // Darkness / night lighting: from GAME_CONFIG.DARKNESS_START_WAVE onward the
+  // arena stays dim and every player carries a flashlight (the themed blackout
+  // event keeps its own darker, one-wave treatment). Same rule in Solo, local
+  // co-op and online — `director.wave` is the local director offline and the
+  // room-mirrored wave online. `NightMode` eases in/out, so a restart restores
+  // full daylight.
+  nightMode.setActive(darknessActive(director.wave, director.event === 'blackout'));
   nightMode.update(dt, players);
 
   // Pulse the perimeter gate warning lamps while the wave is disgorging mobs.
@@ -2170,6 +2268,10 @@ Object.defineProperty(globalThis, '__game_shoot', {
     /** Test hook: whether the blackout lighting rig is engaged. */
     get blackout(): boolean {
       return nightMode.isActive;
+    },
+    /** Test hook: the eased darkness factor (0 = daylight, 1 = full night). */
+    get darkness(): number {
+      return nightMode.darkness;
     },
     /** Test hook: apply damage through the real rules (downed / game over). */
     damagePlayer(index: number, amount: number): void {

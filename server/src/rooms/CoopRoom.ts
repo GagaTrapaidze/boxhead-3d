@@ -200,6 +200,18 @@ export interface CoopJoinOptions {
 }
 
 /**
+ * A shot a client resolved and wants replayed on every OTHER client. This is a
+ * purely cosmetic event (tracer + muzzle flash + gunshot); the damage the shot
+ * caused travels separately via `damageEnemy` / `damageProp` / `explode`.
+ */
+interface PlayerShootMessage {
+  origin?: { x?: number; y?: number; z?: number };
+  direction?: { x?: number; y?: number; z?: number };
+  /** `WeaponId` wire code (see shared/src/weapons.ts). */
+  weaponType?: number;
+}
+
+/**
  * Codes currently in use by live rooms, so `onCreate` never hands out a code
  * that collides with another room in this process (the code doubles as the
  * roomId, which must be unique).
@@ -373,6 +385,33 @@ export class CoopRoom extends Room {
       this.sim.placeProp(kind, cx, cz); // the state patch confirms it for everyone
     });
 
+    // --- shoot: relay a client's fired shot to every OTHER client ------------
+    // Cosmetic only: peers replay the same tracer / muzzle flash / gunshot from
+    // the shooter's weapon position. No entity is spawned and no damage is
+    // applied here — the shooter already resolved and reported its own hit via
+    // `damageEnemy` / `damageProp` / `explode`.
+    this.onMessage('playerShoot', (client: Client, msg: PlayerShootMessage) => {
+      if (!this.isLive()) return;
+      const shooter = this.state.players.get(client.sessionId);
+      if (!shooter || !shooter.alive) return;
+      const directionX = clamp(msg?.direction?.x, -1, 1, 0);
+      const directionZ = clamp(msg?.direction?.z, -1, 1, 0);
+      if (directionX === 0 && directionZ === 0) return; // no aim → nothing to draw
+      this.broadcast(
+        'playerShoot',
+        {
+          origin: {
+            x: clamp(msg?.origin?.x, -512, 512, shooter.x),
+            y: clamp(msg?.origin?.y, 0, 8, 0.7),
+            z: clamp(msg?.origin?.z, -512, 512, shooter.z),
+          },
+          direction: { x: directionX, y: 0, z: directionZ },
+          weaponType: clamp(msg?.weaponType, 0, 255, 0),
+        },
+        { except: client }
+      );
+    });
+
     // --- confirmation: the room owns the blast (damage, chains, kills) --------
     this.onMessage(
       'explode',
@@ -422,16 +461,20 @@ export class CoopRoom extends Room {
   }
 
   /**
-   * Grants one ground drop to one player, if the server agrees that player is
+   * Grants one ground drop to exactly ONE player — the one the server agrees is
    * standing on it. Eligibility is purely positional: every connected, living
    * player is a candidate for every drop — there is no character, skin or seat
    * involved anywhere in this path.
    *
-   * The drop itself is gone from `sim.drops` → it leaves `state.drops` on this
-   * same tick, so the cube vanishes for BOTH clients immediately. Loot is a
-   * shared team benefit: it credits the team pool and is granted to *every*
-   * client (each applies it to its own player), never just the collector. The
-   * `by` field names the player who actually walked it over.
+   * The drop is consumed the instant it is granted: `sim.pickup` splices it out
+   * of the simulation AND it is deleted from `state.drops` right here, so the
+   * cube is gone for every client before the next patch. The award is sent ONLY
+   * to the collecting player (`client.send`, never a broadcast), so a grenade /
+   * weapon drop lands in that player's inventory alone — the teammate never
+   * receives it. The `by` field names the collector.
+   *
+   * Only the shared team score stays pooled: it is credited once here and
+   * mirrored to everyone through `state.teamScore`.
    *
    * Returns the collected kind, or null when the drop is gone / out of reach.
    */
@@ -440,8 +483,11 @@ export class CoopRoom extends Room {
     if (!player || !player.alive) return null;
     const kind = this.sim.pickup(dropId, player.x, player.z);
     if (!kind) return null;
+    // Consumed immediately: leave `state.drops` on this very tick, for good.
+    this.state.drops.delete(String(dropId));
     this.state.teamScore += WAVE_CONFIG.pickupScore;
-    this.broadcast('granted', { kind: dropKindCode(kind), by: sessionId });
+    // Award ONLY to the player who walked it over — never to the teammate.
+    this.clients.getById(sessionId)?.send('granted', { kind: dropKindCode(kind), by: sessionId });
     return kind;
   }
 
@@ -455,7 +501,8 @@ export class CoopRoom extends Room {
    * each drop's position in `state.drops`, at the shared `WAVE_CONFIG.pickupRadius`
    * bounding radius. No client request, character id or skin is consulted, so a
    * player whose walk-over message is lost (or that races the presence relay)
-   * still collects the cube on the next tick.
+   * still collects the cube on the next tick — and that player alone receives
+   * the award (see {@link grantDrop}).
    */
   private collectWalkOverDrops(): void {
     if (this.sim.drops.length === 0) return;

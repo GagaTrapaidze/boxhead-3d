@@ -1,12 +1,15 @@
 /**
- * Blackout / night-wave lighting (special wave event).
+ * Darkness / night-wave lighting.
  *
- * During a blackout wave the arena's ambient rig dims to near pitch-black and
- * every player carries a flashlight: a THREE.SpotLight cone aimed along their
- * current facing. Zombies stay hidden in the dark until they walk into a cone
- * — or are briefly revealed by a muzzle flash (FxLayer) or an explosion blast
+ * From `GAME_CONFIG.DARKNESS_START_WAVE` (shared/src/gameConfig.ts) onward the
+ * arena stays dark in every mode — Solo, local co-op and online — and from a
+ * themed blackout event the same rig runs even darker for its single wave. The
+ * ambient and directional lights ease down, a night fog closes in, and every
+ * player carries a flashlight: a THREE.SpotLight cone aimed along their current
+ * facing. Zombies stay hidden in the dark until they walk into a cone — or are
+ * briefly revealed by a muzzle flash (FxLayer) or an explosion blast
  * (projectiles.ts). The zombie-eye glow is muted in lockstep so no pair of red
- * dots betrays the horde.
+ * dots betrays the horde. `reset()` restores full daylight on a restart.
  */
 import * as THREE from 'three';
 
@@ -20,6 +23,14 @@ const DAY = { sun: 1.2, hemi: 0.6, fill: 0.3 };
 const NIGHT = { sun: 0.03, hemi: 0.04, fill: 0.0 };
 /** Seconds for the ambient rig to ease between day and blackout. */
 const BLEND_SECONDS = 0.8;
+
+/**
+ * Linear fog distances. By day the fog sits far beyond the camera (so it is
+ * invisible); the darkness eases it down into a soft haze that swallows the
+ * far side of the arena and sells the night atmosphere.
+ */
+const DAY_FOG = { near: 1_000_000, far: 2_000_000 };
+const NIGHT_FOG = { near: 24, far: 80 };
 
 const FLASHLIGHT_RANGE = 15; // cone reach in world units
 const FLASHLIGHT_ANGLE = 0.45; // half-angle of the cone (~26°)
@@ -38,8 +49,15 @@ export class NightMode {
   private blend = 0;
   /** One flashlight per player, created lazily and reused across matches. */
   private readonly flashlights: Flashlight[] = [];
+  /**
+   * The arena's night fog. Always attached to the scene — by day it is pushed
+   * far past the camera — so easing it in never forces a shader recompile.
+   */
+  private readonly fog = new THREE.Fog(0x05070f, DAY_FOG.near, DAY_FOG.far);
 
-  constructor(private readonly world: World) {}
+  constructor(private readonly world: World) {
+    this.world.scene.fog = this.fog;
+  }
 
   get isActive(): boolean {
     return this.active;
@@ -77,6 +95,9 @@ export class NightMode {
     this.world.sunLight.intensity = DAY.sun + (NIGHT.sun - DAY.sun) * t;
     this.world.hemiLight.intensity = DAY.hemi + (NIGHT.hemi - DAY.hemi) * t;
     this.world.fillLight.intensity = DAY.fill + (NIGHT.fill - DAY.fill) * t;
+    // fog closes in with the darkness for a hazy, cloistered night.
+    this.fog.near = DAY_FOG.near + (NIGHT_FOG.near - DAY_FOG.near) * t;
+    this.fog.far = DAY_FOG.far + (NIGHT_FOG.far - DAY_FOG.far) * t;
     // eyes fade with the darkness so no glow betrays the shadows
     setZombieEyeGlow(ZOMBIE_EYE_GLOW * (1 - t));
   }

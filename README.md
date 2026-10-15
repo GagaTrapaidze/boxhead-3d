@@ -59,6 +59,11 @@ node scripts/lobby-check.mjs           # needs dev:server
 # kill broadcast + loot roll, server-validated walk-over pickup
 LOBBY_URL=ws://localhost:2567 node scripts/online-world-check.mjs   # needs dev:server
 
+# server-only, remote-shot FX: a `playerShoot` reaches every OTHER client with
+# the origin/direction/weapon intact, never echoes to the shooter, and spawns no
+# server entity (fast bullets stay pure client-side tracers)
+LOBBY_URL=ws://localhost:2567 node scripts/player-shoot-check.mjs   # needs dev:server
+
 # two real browser tabs over CDP: create room, join by code, start, downed
 # countdown, respawn, and Game Over reaching both clients
 node scripts/lobby-browser-check.mjs   # needs dev:server + dev:client
@@ -70,6 +75,11 @@ node scripts/online-world-browser-check.mjs   # same requirements as above
 
 # local 2-player downed → passive revive → Game Over (guards the local rules)
 node scripts/local-revive-check.mjs    # needs dev:client + Chrome on :9333
+
+# darkness band: the arena stays lit below GAME_CONFIG.DARKNESS_START_WAVE (6),
+# eases dark from it on, stays dark on later waves, and the blackout event
+# darkens an early wave — driven over CDP against the real render loop
+node scripts/darkness-check.mjs        # needs dev:client + Chrome on :9333
 
 # Wave-7 Black Devil boss: black mesh + dedicated top-centre "BLACK DEVIL" HP
 # bar, the 3 u/4.5 s shockwave, the 1 s → 3.5 s tracking laser, the 4-cube
@@ -117,6 +127,13 @@ spread, ranges, close-range shotgun scaling, grenade fuse/lethality, drop rates,
 wave pacing, player and enemy stats. Edit that file alone to rebalance the game;
 no engine code hardcodes tuning. `weapons.ts` builds its table from it, so the
 weapons/combo tests check the config directly.
+
+Cross-mode values that must agree between **Solo, local co-op and online** live
+in **`shared/src/gameConfig.ts`** (`GAME_CONFIG`): `DARKNESS_START_WAVE` (the
+wave the night lighting begins and stays on), `BLACK_DEVIL_START_WAVE` (the boss
+encounter) and `SHOCKWAVE_EXPANSION_SPEED`. `balance.config.ts` re-exports them,
+so changing one number there applies to every mode at once — the client lighting
+rig, the offline director and the server world all read the same value.
 
 `npm test` runs:
 
@@ -190,6 +207,10 @@ room applies the damage, kills/destroys, rolls loot and broadcasts the result:
 - **Explosive chains** are server-side: a barrel that detonates queues its
   neighbours on a staggered fuse (`chainFuseDelay`), and every client plays the
   same blasts in the same order.
+- **Loot is per-player**: a walk-over grant is delivered ONLY to the player who
+  stepped on the cube (`granted {kind, by}`), and the cube is removed from
+  `state.drops` on the same tick — so a grenade / weapon drop never lands in a
+  teammate's inventory. Only the shared `teamScore` still credits the whole team.
 - **Offline modes are untouched** — every online branch is behind `isOnline`, and
   local single-player/co-op still simulate the horde in the browser.
 - Simulation runs at the shared `TICK_RATE` (30 Hz) with `SNAPSHOT_RATE`-paced

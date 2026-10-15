@@ -1,5 +1,6 @@
 // Public surface of the shared package (client + server import from here).
 export * from './constants.ts';
+export * from './gameConfig.ts';
 export * from './binary/bytes.ts';
 export * from './quantize.ts';
 export * from './protocol/messages.ts';

@@ -19,8 +19,10 @@
  *  - `damageEnemy` kills → `enemyKilled` broadcast (with the killer's id) and the
  *    mob removed from state for everyone;
  *  - kills roll loot into `state.drops`, and the room's OWN walk-over collision
- *    (all players × all drops, every tick) grants + removes it for both clients
- *    — identically for the host and for the second player (seat 1);
+ *    (all players × all drops, every tick) grants + removes it for exactly ONE
+ *    player — the one who walked it over — identically for the host and for the
+ *    second player (seat 1). The award is sent ONLY to that collector, so a
+ *    grenade / weapon drop never lands in a teammate's inventory;
  *  - the wave director is mirrored into the room state;
  *  - the shared team score (`state.teamScore`) is credited by the room for kills
  *    and loot, patches the identical value to both clients, and resets on a
@@ -76,6 +78,13 @@ function nextMessage(room, type, timeoutMs = 4000) {
       resolve(msg);
     });
   });
+}
+
+/** Collects every `type` message a room receives (for negative assertions too). */
+function collect(room, type) {
+  const messages = [];
+  room.onMessage(type, (msg) => messages.push(msg));
+  return messages;
 }
 
 function assert(condition, message) {
@@ -262,21 +271,23 @@ try {
   // Walk the host onto the drop. The presence pump is stopped first so it
   // cannot drag the player back off the drop. The ROOM owns the collision: no
   // `pickupItem` message is needed — the next simulation tick grants the cube
-  // to the player standing on it and broadcasts the award to every client.
+  // to the player standing on it and awards THAT player alone.
   clearInterval(presenceTimer);
   presenceTimer = null;
   const scoreBeforePickup = hostRoom.state.teamScore;
-  const peerGranted = nextMessage(guestRoom, 'granted'); // the peer must hear it too
+  const guestGrants = collect(guestRoom, 'granted'); // the teammate must NOT hear this one
   const granted = nextMessage(hostRoom, 'granted');
   hostRoom.send('presence', { x: drop.x, z: drop.z, aimX: 1, aimZ: 0, hp: 100, weapon: 0 });
   const award = await granted;
-  const sharedAward = await peerGranted;
-  assert(typeof award.kind === 'number', `pickup granted (kind ${award.kind})`);
-  assert(
-    sharedAward.kind === award.kind,
-    'the loot award is broadcast to BOTH players (shared benefit)'
-  );
+  assert(typeof award.kind === 'number', `pickup granted to the collector (kind ${award.kind})`);
   assert(award.by === hostRoom.sessionId, 'the award names the collecting player');
+  // Isolation: the ONE award went to the collector alone — the teammate hears
+  // nothing, so the same grenade / weapon can never appear in two inventories.
+  await sleep(400);
+  assert(
+    guestGrants.every((grant) => grant.by !== hostRoom.sessionId),
+    'the pickup award is sent ONLY to the collecting player (teammate inventory untouched)'
+  );
   // The grant is written into the room state in the same message as the score,
   // but the client copy lands on the next state patch — wait for it.
   await waitFor(
@@ -346,7 +357,7 @@ try {
   assert(!!second, `a drop is on the ground for the second player (id ${second?.id})`);
 
   const guestScoreBefore = hostRoom.state.teamScore;
-  const hostGrant = nextMessage(hostRoom, 'granted');
+  const hostGrants = collect(hostRoom, 'granted'); // the host must NOT hear this one
   const guestGrant = nextMessage(guestRoom, 'granted');
   guestRoom.send('presence', { x: second.x, z: second.z, aimX: 1, aimZ: 0, hp: 100, weapon: 0 });
   const guestAward = await guestGrant;
@@ -354,9 +365,10 @@ try {
     guestAward.by === guestRoom.sessionId,
     'the award names the second player (seat 1) as the collector'
   );
+  await sleep(400);
   assert(
-    (await hostGrant).kind === guestAward.kind,
-    'the second player\'s pickup is broadcast to the host as well (shared benefit)'
+    hostGrants.every((grant) => grant.by !== guestRoom.sessionId),
+    "the second player's pickup is sent ONLY to them (host inventory untouched)"
   );
   // Other cubes may legitimately be swept up while this one is collected (the
   // horde keeps dying around the parked players), so assert the credit is at
