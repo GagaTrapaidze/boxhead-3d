@@ -793,11 +793,11 @@ export const ENEMY_CONFIG: EnemyBalance = {
   devilDashInterval: 3.5,
   devilDashWindup: 0.5,
   devilDashSpeedMultiplier: 2.5,
-  devilDashDuration: 1.2,
+  devilDashDuration: 3.5,
   devilTrailLife: 3.5,
   devilTrailDamage: 10,
   devilTrailTick: 0.5,
-  devilTrailDropInterval: 0.25,
+  devilTrailDropInterval: 0.1,
   devilTrailRadius: 0.55,
 };
 
