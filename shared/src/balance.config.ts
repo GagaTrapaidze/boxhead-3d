@@ -733,7 +733,7 @@ export const ENEMY_CONFIG: EnemyBalance = {
   // GRENADE_CONFIG.damage (9999) is far above their HP at any blast distance.
   devil: {
     hp: 850, // 500 < 850 ≤ 1000 → exactly two direct explosions
-    speed: 1.8,
+    speed: 2.2,
     damage: 15,
     radius: 0.7,
     score: 100,
