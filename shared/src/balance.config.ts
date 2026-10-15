@@ -429,8 +429,8 @@ export interface DropBalance {
 
 /** Base drop chance before the global frequency multiplier (35% drop rate). */
 const BASE_DROP_RATE = 0.35;
-/** Global frequency multiplier: set to 1 so the effective rate matches BASE_DROP_RATE directly. */
-const DROP_MULTIPLIER = 1;
+/** Global drop-frequency multiplier: 0.70 = exactly 30% fewer drops. */
+const DROP_MULTIPLIER = 0.7;
 
 /**
  * THE drop-tuning table. `mobDropMultiplier: 0.70` reduces the overall drop
@@ -450,10 +450,10 @@ export const DROP_CONFIG: DropBalance = {
     power: 10,
   },
   pickupAwards: {
-    shotgun: 5,
-    uzi: 25,
-    grenade: 2,
-    barrel: 5,
+    shotgun: 30,
+    uzi: 150,
+    grenade: 5,
+    barrel: 3,
   },
   /** Memory-friendly: ground cubes clean themselves up after 15 s. */
   pickupLifeSeconds: 15,
@@ -708,14 +708,14 @@ export interface EnemyBalance {
 
 export const ENEMY_CONFIG: EnemyBalance = {
   walker: { hp: 60, speed: 2.0, damage: 10, radius: 0.45, score: 10 },
-  runner: { hp: 10, speed: 3.6, damage: 7, radius: 0.4, score: 15 },
+  runner: { hp: 40, speed: 3.6, damage: 7, radius: 0.4, score: 15 },
   // Boss resilience. Invariant (asserted by shared/test/balance.test.ts):
   //   explosiveDamageCap < hp ≤ 2 × explosiveDamageCap
   // so ONE direct grenade blast wounds the Devil and exactly TWO destroy it,
   // while standard mobs (60 / 40 HP) stay a guaranteed one-hit kill because
   // GRENADE_CONFIG.damage (9999) is far above their HP at any blast distance.
   devil: {
-    hp: 600, // 500 < 850 ≤ 1000 → exactly two direct explosions
+    hp: 850, // 500 < 850 ≤ 1000 → exactly two direct explosions
     speed: 1.8,
     damage: 15,
     radius: 0.7,
@@ -743,10 +743,10 @@ export const ENEMY_CONFIG: EnemyBalance = {
     spinnerRangeMin: 3,
     spinnerRangeMax: 13,
     spinnerSpinRate: 9,
-    shockwaveRadius: 15,
+    shockwaveRadius: 4,
     shockwaveDamage: 25,
     shockwaveCooldown: 4.5,
-    shockwaveTriggerRange: 10,
+    shockwaveTriggerRange: 3,
     // 4 u ring at 12 u/s: a 0.33 s window to break line-of-sight behind cover.
     shockwaveExpansionSpeed: SHOCKWAVE_EXPANSION_SPEED,
     shockwaveRingThickness: 0.5,
@@ -840,10 +840,17 @@ export interface WaveEventBalance {
 
 export const WAVE_EVENT_CONFIG: WaveEventBalance = {
   period: 8,
-  speedHordeOffset: 3,
-  blackoutOffset: 5, 
+  speedHordeOffset: 4, // waves 4, 12, 20 …
+  blackoutOffset: 0, // waves 8, 16, 24 …
   runnerSpeedBonus: 0.8,
 };
+
+/**
+ * Absolute floor for the Black Devil encounter. The boss may never spawn before
+ * this wave, even if `blackDevilWave` is ever misconfigured — waves 1–6 always
+ * field only the standard horde.
+ */
+export const BLACK_DEVIL_MIN_WAVE = 7;
 
 export const DIRECTOR_CONFIG: DirectorBalance = {
   openingIntermission: 4,

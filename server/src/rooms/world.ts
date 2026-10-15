@@ -19,6 +19,7 @@ import { getMap } from '../../../shared/src/maps.ts';
 import type { MapDefinition } from '../../../shared/src/maps.ts';
 import {
   BARREL_CONFIG,
+  BLACK_DEVIL_MIN_WAVE,
   CRATE_CONFIG,
   DIRECTOR_CONFIG,
   ENEMY_CONFIG,
@@ -552,7 +553,11 @@ export class WorldSim {
   private buildQueue(): void {
     // Wave-7 boss encounter: the standard horde is halved (−50% small mobs) so
     // players can focus the Black Devil, and no extra red Devils join it.
-    const bossWave = this.wave === DIRECTOR_CONFIG.blackDevilWave;
+    //
+    // Strict spawn gate: the encounter wave is clamped to a hard floor so the
+    // boss can NEVER leak into waves 1–6, even if the balance table drifts.
+    const bossWaveIndex = Math.max(DIRECTOR_CONFIG.blackDevilWave, BLACK_DEVIL_MIN_WAVE);
+    const bossWave = this.wave === bossWaveIndex;
     const mobMultiplier = bossWave ? DIRECTOR_CONFIG.blackDevilMobCountMultiplier : 1;
     const count = Math.round(
       Math.min(

@@ -355,3 +355,45 @@ test('black devil death pops a 3–4 reward loot explosion', () => {
     `expected ${BLACK.lootDropMin}–${BLACK.lootDropMax} rewards, got ${dropped}`
   );
 });
+
+test('the Black Devil first spawns on wave 7 — never in waves 1–6', () => {
+  const sim = new WorldSim('classic-bunker');
+  sim.syncPlayers([{ id: 'p1', x: 20.5, z: 20.5, alive: true }]);
+
+  let firstBossWave = -1;
+  let lastWave = 0;
+  // Clear each wave as it disgorges so the director advances to the next one.
+  for (let t = 0; t < 30 * 400 && lastWave <= DIRECTOR_CONFIG.blackDevilWave; t++) {
+    sim.step(DT);
+    lastWave = sim.wave;
+    if (firstBossWave === -1 && sim.enemies.some((enemy) => enemy.kind === 'blackDevil')) {
+      firstBossWave = sim.wave;
+    }
+    for (const enemy of [...sim.enemies]) sim.damageEnemy(enemy.id, 1e9, 0, 'p1');
+  }
+
+  assert.equal(
+    firstBossWave,
+    DIRECTOR_CONFIG.blackDevilWave,
+    'the boss first appears on the wave-7 encounter, never earlier'
+  );
+  assert.ok(DIRECTOR_CONFIG.blackDevilWave >= 7, 'the encounter is gated to wave 7 or later');
+});
+
+test('a fresh match resets the wave counter and opens on wave 1 with no boss', () => {
+  const sim = new WorldSim('classic-bunker');
+  sim.syncPlayers([{ id: 'p1', x: 20.5, z: 20.5, alive: true }]);
+  sim.wave = 9;
+  sim.event = 'blackout';
+  sim.phase = 'active';
+
+  sim.reset('classic-bunker');
+  assert.equal(sim.wave, 0, 'reset returns the director to its pre-game wave');
+
+  for (let i = 0; i < 600 && sim.wave < 1; i++) sim.step(DT);
+  assert.equal(sim.wave, 1, 'the first wave of a new match is wave 1');
+  assert.ok(
+    !sim.enemies.some((enemy) => enemy.kind === 'blackDevil'),
+    'wave 1 fields only the standard horde'
+  );
+});
