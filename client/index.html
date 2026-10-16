@@ -73,6 +73,54 @@
       #powerup { color: #d78bff; }
       #powerup[hidden] { display: none; }
 
+      /* Secret LIZI mode chip — bottom-centre, only shown for a LIZI player.
+         Clickable as well as toggled by the 'G' key. */
+      .liziModeChip {
+        position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 7;
+        pointer-events: auto; cursor: pointer; user-select: none;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12.5px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
+        padding: 7px 14px; border-radius: 999px; color: #ffd7ef;
+        background: rgba(30, 8, 24, .72); border: 1px solid rgba(255, 110, 199, .5);
+        transition: background .15s, border-color .15s, color .15s, box-shadow .15s;
+      }
+      .liziModeChip[hidden] { display: none; }
+      .liziModeChip:hover { border-color: #ff6ec7; }
+      .liziModeChip.active {
+        color: #0b0f1a; background: linear-gradient(90deg, #ff6ec7, #ffd35c);
+        border-color: #ffd35c; box-shadow: 0 0 16px rgba(255, 110, 199, .55);
+        animation: liziPulse 1.6s ease-in-out infinite;
+      }
+      @keyframes liziPulse { 50% { box-shadow: 0 0 22px rgba(255, 110, 199, .9); } }
+
+      /* ---------- LIZI god-mode speed slider (HUD overlay) ---------- */
+      .speedSliderWrap {
+        position: fixed; left: 16px; bottom: 176px; z-index: 7; width: 212px;
+        pointer-events: auto; user-select: none;
+        padding: 8px 12px 10px; border-radius: 12px;
+        background: rgba(30, 8, 24, .7); border: 1px solid rgba(255, 110, 199, .4);
+        box-shadow: 0 0 14px rgba(255, 110, 199, .18);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      .speedSliderWrap[hidden] { display: none; }
+      .speedSliderLabel { display: block; font-size: 11.5px; letter-spacing: 1px;
+        text-transform: uppercase; color: #ffd7ef; margin-bottom: 6px; }
+      .speedSliderLabel b { color: #ffd35c; }
+      .speedSlider {
+        width: 100%; height: 4px; margin: 0; cursor: pointer; outline: none;
+        -webkit-appearance: none; appearance: none; border-radius: 999px;
+        background: linear-gradient(90deg, #ff6ec7, #ffd35c);
+      }
+      .speedSlider::-webkit-slider-thumb {
+        -webkit-appearance: none; appearance: none; width: 16px; height: 16px;
+        border-radius: 50%; background: #fff; border: 2px solid #ff6ec7;
+        box-shadow: 0 0 8px rgba(255, 110, 199, .8); cursor: pointer;
+      }
+      .speedSlider::-moz-range-thumb {
+        width: 16px; height: 16px; border-radius: 50%; background: #fff;
+        border: 2px solid #ff6ec7; cursor: pointer;
+      }
+
       /* ---------- Per-player status cards (split-screen co-op HUD) ---------- */
       .pcard {
         position: fixed; bottom: 16px; z-index: 6; width: 258px;
@@ -260,6 +308,56 @@
       .mapCard span { display: block; font-size: 12.5px; opacity: .82;
         line-height: 1.45; margin-top: 3px; }
 
+      /* ---------- Discreet "Secret" unlock (top-right corner of the menu) ---------- */
+      .menuTop { display: flex; justify-content: flex-end; margin-bottom: 2px; }
+      .secretBtn {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 5px 12px; font-size: 12px; font-weight: 700; letter-spacing: 1px;
+        text-transform: uppercase; cursor: pointer; color: #8b93a3; opacity: .6;
+        background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.1);
+        border-radius: 999px;
+        transition: opacity .15s, color .15s, border-color .15s, background .15s;
+      }
+      .secretBtn:hover { opacity: 1; color: #ffd7ef; border-color: rgba(255,110,199,.55); }
+      .secretBtn.active {
+        opacity: 1; color: #0b0f1a; background: linear-gradient(90deg, #ff6ec7, #ffd35c);
+        border-color: #ffd35c; box-shadow: 0 0 14px rgba(255,110,199,.45);
+      }
+      .secretBtn[hidden] { display: none; }
+
+      /* ---------- Secret-character unlock modal ---------- */
+      .liziModal {
+        position: fixed; inset: 0; z-index: 40; display: grid; place-items: center;
+        background: rgba(4, 6, 14, .82); backdrop-filter: blur(6px); padding: 20px;
+      }
+      .liziModal[hidden] { display: none; }
+      .liziCard {
+        width: min(420px, 92vw); text-align: center; padding: 26px 22px 22px;
+        border-radius: 16px; background: linear-gradient(180deg, #12172a, #0a0d18);
+        border: 1px solid #33244a;
+        box-shadow: 0 0 0 1px rgba(255,110,199,.25) inset, 0 18px 50px rgba(0,0,0,.6);
+        animation: liziPop .22s ease-out;
+      }
+      @keyframes liziPop { from { opacity: 0; transform: scale(.92); } to { opacity: 1; transform: scale(1); } }
+      .liziLockBadge { font-size: 40px; margin-bottom: 6px; }
+      .liziCard h2 { font-size: 20px; letter-spacing: 3px; color: #ff6ec7; margin-bottom: 6px; }
+      .liziCard p { font-size: 13px; opacity: .78; margin-bottom: 14px; }
+      .liziCard input {
+        width: 100%; padding: 12px 14px; font-size: 18px; letter-spacing: 6px; text-align: center;
+        border-radius: 10px; border: 1px solid #3a4a6b; background: #0d1220; color: #eaf2ff;
+      }
+      .liziCard input:focus { outline: none; border-color: #ff6ec7;
+        box-shadow: 0 0 0 2px rgba(255,110,199,.25); }
+      .liziError { min-height: 18px; margin: 8px 0 4px; font-size: 12.5px; color: #ff7a7a;
+        letter-spacing: 1px; }
+      .liziBtns { display: flex; gap: 10px; justify-content: center; }
+      .liziCard.shake { animation: liziShake .3s; }
+      @keyframes liziShake {
+        0%, 100% { transform: translateX(0); }
+        25% { transform: translateX(-8px); }
+        75% { transform: translateX(8px); }
+      }
+
       #onlinePanel { margin: 0 auto 18px; display: flex; gap: 8px; justify-content: center;
         align-items: center; flex-wrap: wrap; }
       #onlinePanel[hidden] { display: none; }
@@ -400,6 +498,16 @@
         <div id="bossName">BLACK DEVIL</div>
         <div id="bossTrack"><span id="bossFill"></span></div>
       </div>
+      <!-- Secret LIZI god-mode badge (rendered only while a LIZI player is active). -->
+      <button id="liziMode" class="liziModeChip" type="button" hidden>LIZI GOD MODE: OFF — press G / F8</button>
+
+      <!-- LIZI god-mode speed slider (bottom-left, above the player card). -->
+      <div id="speedSliderWrap" class="speedSliderWrap" hidden>
+        <label class="speedSliderLabel" for="speedSlider">Speed: <b id="speedSliderValue">1.0x</b></label>
+        <input id="speedSlider" class="speedSlider" type="range"
+          min="1" max="3.5" step="0.1" value="1" aria-label="Movement speed multiplier" />
+      </div>
+
       <div id="sharedStats">
         <div id="multRow">
           <div class="multHead">MULTIPLIER ×<span id="multVal">1</span><span id="mult2" hidden></span></div>
@@ -444,6 +552,11 @@
     <div id="overlay">
       <!-- ============ START MENU ============ -->
       <section class="panel" id="menuPanel">
+        <!-- Standard characters are auto-assigned; this discreet button is the
+             only character-related control (secret session-only unlock). -->
+        <div class="menuTop">
+          <button id="secretBtn" class="secretBtn" type="button" title="Secret character">🔒 Secret</button>
+        </div>
         <h1>boxhead: <span>2play rooms</span></h1>
         <p class="tagline">Kill or be killed. Keep the multiplier high — earn better weapons.</p>
 
@@ -598,6 +711,22 @@
         <button class="bigBtn" id="restartBtn">PLAY AGAIN</button>
         <button class="bigBtn ghost" id="menuBtn">MENU</button>
       </section>
+    </div>
+
+    <!-- Secret-character unlock prompt (opened by the locked LIZI slot). -->
+    <div id="liziModal" class="liziModal" hidden>
+      <div class="liziCard">
+        <div class="liziLockBadge">🔒</div>
+        <h2>SECRET CHARACTER</h2>
+        <p>შეიყვანე საიდუმლო კოდი</p>
+        <input id="liziCode" type="password" maxlength="16" autocomplete="off"
+          placeholder="••••" aria-label="secret code" />
+        <div id="liziError" class="liziError"></div>
+        <div class="liziBtns">
+          <button id="liziSubmit" type="button" class="bigBtn">UNLOCK</button>
+          <button id="liziCancel" type="button" class="bigBtn ghost">CANCEL</button>
+        </div>
+      </div>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

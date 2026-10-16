@@ -82,6 +82,15 @@ export interface CharacterDef {
   readonly skinColor: number;
   /** The weapon 'slot' color is used for a distinct uniform patch. */
   readonly uniformColor: number;
+  /**
+   * Body builder to use. Omitted (or `'boxhead'`) = the standard soldier mesh;
+   * `'lizi'` builds the secret girl model (see {@link buildLiziMesh}).
+   */
+  readonly style?: 'boxhead' | 'lizi';
+  /** Hair color (cube hair) — only the LIZI builder reads this. */
+  readonly hairColor?: number;
+  /** Eye color — only the LIZI builder reads this. */
+  readonly eyeColor?: number;
 }
 
 /** The four lore characters; P1 defaults to Bambo, P2 to Bon. */
@@ -118,6 +127,22 @@ export const CHARACTERS = {
     skinColor: 0xe8d4a8,
     uniformColor: 0x3a3a3a,
   },
+  /**
+   * SECRET character — unlocked with the code on the selection screen. She uses
+   * the dedicated girl builder (pink dress + cube hair + blue eyes + nameplate)
+   * and her balance lives in `LIZI_STATS` (shared/src/balance.config.ts).
+   */
+  lizi: {
+    name: 'LIZI',
+    style: 'lizi',
+    torsoColor: 0xff6ec7, // pink dress
+    headColor: 0x8a5a2b, // chestnut / auburn hair
+    legColor: 0xf7a8d8, // dress hem
+    skinColor: 0xf6d3b3, // fair skin
+    uniformColor: 0xffd7ef, // pale ribbon / trim
+    hairColor: 0x8a5a2b, // chestnut / auburn brown
+    eyeColor: 0x2f7ddb, // blue eyes
+  },
 } as const satisfies Record<string, CharacterDef>;
 
 export type CharacterId = keyof typeof CHARACTERS;
@@ -135,6 +160,10 @@ function box(w: number, h: number, d: number, color: number): THREE.Mesh {
 
 /** Distinct head, torso, shoulder tubes and hands for a character. */
 export function buildBoxhead(character: CharacterDef): THREE.Group {
+  // The secret character ships her own body builder; every other character
+  // shares the standard soldier mesh.
+  if (character.style === 'lizi') return buildLiziMesh(character);
+
   const group = new THREE.Group();
 
   const skin = character.skinColor;
@@ -194,6 +223,136 @@ export function buildBoxhead(character: CharacterDef): THREE.Group {
   const weapon = buildWeaponMesh(0); // default pistol
   weapon.position.set(0, 0.76, 0.4);
   group.add(weapon);
+
+  return group;
+}
+
+// ─── Secret character: LIZI ─────────────────────────────────────────────────
+
+/** Cached nameplate materials, keyed by `text:color` (one texture per label). */
+const NAMEPLATE_MATERIALS = new Map<string, THREE.SpriteMaterial>();
+
+/**
+ * A camera-facing nameplate rendered from a canvas texture. Sprites always
+ * billboard toward the camera, so the label stays readable as the actor turns
+ * and on every camera angle. The material is cached for the page lifetime.
+ */
+function buildNameplateSprite(text: string, color = '#ffd0ec'): THREE.Sprite {
+  const key = `${text}:${color}`;
+  let material = NAMEPLATE_MATERIALS.get(key);
+  if (!material) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 72;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.font = 'bold 52px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.lineWidth = 8;
+      ctx.strokeStyle = 'rgba(10, 6, 16, 0.9)'; // dark outline keeps it legible
+      ctx.strokeText(text, 128, 38);
+      ctx.fillStyle = color;
+      ctx.fillText(text, 128, 38);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.anisotropy = 4;
+    material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+    NAMEPLATE_MATERIALS.set(key, material);
+  }
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(1.05, 0.3, 1);
+  return sprite;
+}
+
+/**
+ * The secret character "LIZI": a blocky girl in a pink dress with cube-styled
+ * chestnut/auburn hair, blue eyes and a floating "LIZI" nameplate. Same Boxhead
+ * proportions and shared resource caches as {@link buildBoxhead}; her weapon
+ * group sits at z = 0.4 so {@link updateWeaponMesh} swaps it like any soldier's.
+ */
+export function buildLiziMesh(character: CharacterDef): THREE.Group {
+  const group = new THREE.Group();
+  const skin = character.skinColor;
+  const dress = character.torsoColor;
+  const hair = character.hairColor ?? character.headColor;
+  const trim = character.uniformColor;
+
+  // legs (mostly hidden under the dress flare)
+  const leftLeg = box(0.18, 0.5, 0.2, skin);
+  leftLeg.position.set(-0.12, 0.25, 0);
+  const rightLeg = box(0.18, 0.5, 0.2, skin);
+  rightLeg.position.set(0.12, 0.25, 0);
+  group.add(leftLeg, rightLeg);
+
+  // pink dress: flared skirt + bodice + a pale ribbon at the waist
+  const skirt = new THREE.Mesh(boxGeometry(0.62, 0.34, 0.46), partMaterial(dress, 0.8));
+  skirt.position.y = 0.55;
+  const bodice = new THREE.Mesh(boxGeometry(0.5, 0.46, 0.34), partMaterial(dress, 0.8));
+  bodice.position.y = 0.9;
+  const ribbon = new THREE.Mesh(boxGeometry(0.56, 0.08, 0.4), partMaterial(trim, 0.8));
+  ribbon.position.y = 0.7;
+  group.add(skirt, bodice, ribbon);
+
+  // shoulders + bare arms + hands
+  const shoulderMaterial = partMaterial(dress, 0.8);
+  const leftShoulder = new THREE.Mesh(boxGeometry(0.16, 0.16, 0.16), shoulderMaterial);
+  leftShoulder.position.set(-0.3, 1.04, 0);
+  const rightShoulder = new THREE.Mesh(boxGeometry(0.16, 0.16, 0.16), shoulderMaterial);
+  rightShoulder.position.set(0.3, 1.04, 0);
+  const leftArm = box(0.14, 0.42, 0.16, skin);
+  leftArm.position.set(-0.3, 0.84, 0);
+  const rightArm = box(0.14, 0.42, 0.16, skin);
+  rightArm.position.set(0.3, 0.84, 0);
+  const handMaterial = partMaterial(skin, 0.8);
+  const leftHand = new THREE.Mesh(boxGeometry(0.13, 0.13, 0.13), handMaterial);
+  leftHand.position.set(-0.3, 0.62, 0.28);
+  const rightHand = new THREE.Mesh(boxGeometry(0.13, 0.13, 0.13), handMaterial);
+  rightHand.position.set(0.3, 0.62, 0.28);
+  group.add(leftShoulder, rightShoulder, leftArm, rightArm, leftHand, rightHand);
+
+  // head + neck
+  const neck = new THREE.Mesh(boxGeometry(0.18, 0.12, 0.18), partMaterial(skin, 0.8));
+  neck.position.y = 1.12;
+  const head = new THREE.Mesh(boxGeometry(0.44, 0.44, 0.44), partMaterial(skin, 0.8));
+  head.position.y = 1.32;
+  group.add(neck, head);
+
+  // ── cube-styled chestnut / auburn hair ──
+  const hairMaterial = partMaterial(hair, 0.85);
+  const hairTop = new THREE.Mesh(boxGeometry(0.5, 0.24, 0.5), hairMaterial);
+  hairTop.position.y = 1.58;
+  const hairBack = new THREE.Mesh(boxGeometry(0.5, 0.52, 0.14), hairMaterial);
+  hairBack.position.set(0, 1.32, -0.24);
+  const hairLeft = new THREE.Mesh(boxGeometry(0.12, 0.44, 0.44), hairMaterial);
+  hairLeft.position.set(-0.24, 1.28, 0);
+  const hairRight = new THREE.Mesh(boxGeometry(0.12, 0.44, 0.44), hairMaterial);
+  hairRight.position.set(0.24, 1.28, 0);
+  const bangs = new THREE.Mesh(boxGeometry(0.46, 0.12, 0.12), hairMaterial);
+  bangs.position.set(0, 1.5, 0.22);
+  group.add(hairTop, hairBack, hairLeft, hairRight, bangs);
+
+  // blue eyes on the face
+  const eyeMaterial = surfaceMaterial('lizi:eye', {
+    color: character.eyeColor ?? 0x2f7ddb,
+    emissive: 0x143a66,
+    emissiveIntensity: 0.35,
+  });
+  const leftEye = new THREE.Mesh(boxGeometry(0.1, 0.11, 0.06), eyeMaterial);
+  leftEye.position.set(-0.1, 1.34, 0.22);
+  const rightEye = new THREE.Mesh(boxGeometry(0.1, 0.11, 0.06), eyeMaterial);
+  rightEye.position.set(0.1, 1.34, 0.22);
+  group.add(leftEye, rightEye);
+
+  // held weapon (pivot at z > 0.3 so updateWeaponMesh swaps it like any actor)
+  const weapon = buildWeaponMesh(0); // default pistol
+  weapon.position.set(0, 0.64, 0.4);
+  group.add(weapon);
+
+  // floating nameplate
+  const nameplate = buildNameplateSprite(character.name);
+  nameplate.position.set(0, 1.98, 0);
+  group.add(nameplate);
 
   return group;
 }

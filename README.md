@@ -91,6 +91,14 @@ node scripts/devil-dash-check.mjs      # needs dev:client + Chrome on :9333
 # bar, the 3 u/4.5 s shockwave, the 1 s → 3.5 s tracking laser, the 4-cube
 # spinner projectile and the 3–4 reward loot explosion
 node scripts/black-devil-browser-check.mjs   # same requirements as above
+
+# Secret character "LIZI": no standard picker (defaults auto-assigned), the
+# discreet "Secret" button + "moon" code modal (trimmed, case-insensitive), the
+# SESSION-ONLY override (nothing persisted, so a reload resets to the default),
+# her LIZI_STATS in-match (150 HP, ×1.3 outgoing weapon damage), the LIZI-only
+# 'G'/'F8' GOD MODE (invulnerable, all weapons, infinite ammo) and the god-mode
+# speed slider (1.0–3.5x, its events isolated from gameplay input)
+node scripts/lizi-check.mjs                  # same requirements as above
 ```
 
 ## Deployment (Render + Vercel)

@@ -24,6 +24,7 @@ import {
   DIRECTOR_CONFIG,
   ENEMY_CONFIG,
   JUICE_CONFIG,
+  LIZI_SPEED_SLIDER,
   WAVE_CONFIG,
 } from '../../shared/src/balance.config.ts';
 import { advanceRevive, isInReviveCircle } from '../../shared/src/revive.ts';
@@ -46,14 +47,16 @@ import { CameraController } from './game/camera.ts';
 import { InputManager } from './game/input.ts';
 import type { GameMode } from './game/input.ts';
 import {
-  PLAYER_MAX_HP,
   PLAYER_RADIUS,
+  ammoCost,
   applyRecoil,
+  canUseLiziMode,
   comboReset,
   comboTick,
   createPlayer,
   cycleWeapon,
   decayRecoil,
+  disableLiziMode,
   ensureWeaponUnlocked,
   fireHitscan,
   healToFull,
@@ -63,6 +66,7 @@ import {
   selectSlot,
   setAimDirection,
   syncActor,
+  toggleLiziMode,
 } from './game/player.ts';
 import { updateWeaponMesh } from './game/actors.ts';
 import type { CharacterId } from './game/actors.ts';
@@ -112,6 +116,7 @@ import {
   showMenu,
 } from './ui/menu.ts';
 import type { MatchSummary, PlayerSummary, StartMode } from './ui/menu.ts';
+import { getCharacterOverride, initSecretCharacter } from './ui/secretCharacter.ts';
 import { Lobby } from './network/lobby.ts';
 import type { OnlinePlayer, PlayerShootEvent, RoomInfo } from './network/lobby.ts';
 import { OnlineWorld } from './network/onlineWorld.ts';
@@ -157,6 +162,47 @@ const eventBannerEl = byId('eventBanner');
 const waveTimerEl = byId('waveTimer');
 const bossBar = byId('bossBar');
 const bossFill = byId('bossFill');
+/** Secret LIZI god-mode chip — only shown while a LIZI player is in the match. */
+const liziChipEl = byId<HTMLButtonElement>('liziMode');
+// Pressing the chip (or 'G' / 'F8') toggles the secret god mode.
+liziChipEl.addEventListener('click', () => toggleLiziModeForPlayers());
+
+/** God-mode speed slider (shown while a LIZI player is in the match). */
+const speedSliderWrap = byId('speedSliderWrap');
+const speedSliderEl = byId<HTMLInputElement>('speedSlider');
+const speedSliderValueEl = byId('speedSliderValue');
+
+/** Pushes the slider's live multiplier onto every LIZI player + the readout. */
+function applySpeedSlider(): void {
+  const parsed = Number.parseFloat(speedSliderEl.value);
+  const speed = Number.isFinite(parsed) ? parsed : LIZI_SPEED_SLIDER.DEFAULT;
+  for (const player of players) {
+    if (canUseLiziMode(player)) player.speedMultiplier = speed;
+  }
+  speedSliderValueEl.textContent = `${speed.toFixed(1)}x`;
+}
+
+/** Resets the slider (and LIZI players) to the standard 1.0x multiplier. */
+function resetSpeedSlider(): void {
+  speedSliderEl.value = String(LIZI_SPEED_SLIDER.DEFAULT);
+  applySpeedSlider();
+}
+
+// Configure the range input from the single source of truth (balance.config.ts)
+// and keep its events from reaching the game's window-level input listeners, so
+// dragging it never fires a shot or moves the player.
+speedSliderEl.min = String(LIZI_SPEED_SLIDER.MIN);
+speedSliderEl.max = String(LIZI_SPEED_SLIDER.MAX);
+speedSliderEl.step = String(LIZI_SPEED_SLIDER.STEP);
+speedSliderEl.value = String(LIZI_SPEED_SLIDER.DEFAULT);
+speedSliderEl.addEventListener('input', () => applySpeedSlider());
+for (const type of [
+  'pointerdown', 'pointermove', 'pointerup',
+  'mousedown', 'mouseup', 'click', 'touchstart', 'touchmove', 'touchend',
+  'keydown', 'keyup',
+]) {
+  speedSliderWrap.addEventListener(type, (event) => event.stopPropagation());
+}
 
 /** DOM handles for one split-screen player status card. */
 interface PlayerCard {
@@ -456,6 +502,8 @@ function clearWorld(): void {
   reviveCircle.hide();
   curseCircle.hide();
   nightMode.reset();
+  liziChipEl.hidden = true;
+  speedSliderWrap.hidden = true;
 
   for (const player of players) removePlayerMesh(world.scene, player);
   players = [];
@@ -491,12 +539,16 @@ function startGame(selectedMode: StartMode, mapId: string = lastMapId): void {
 
   const spawns = currentMap.playerSpawns;
   const first = { x: spawns[0].x, z: spawns[0].y };
+  // Standard characters are auto-assigned (there is no picker): P1 gets the
+  // first skin, P2 the second. The session-only secret unlock overrides P1.
+  const chosen = getCharacterOverride() ?? CHARACTER_ORDER[0];
   if (mode === 'single') {
-    players.push(createPlayer(world.scene, 0, 'bambo', first));
+    players.push(createPlayer(world.scene, 0, chosen, first));
   } else {
-    players.push(createPlayer(world.scene, 0, 'bambo', first));
-    players.push(createPlayer(world.scene, 1, 'bon', { x: spawns[1].x, z: spawns[1].y }));
+    players.push(createPlayer(world.scene, 0, chosen, first));
+    players.push(createPlayer(world.scene, 1, CHARACTER_ORDER[1], { x: spawns[1].x, z: spawns[1].y }));
   }
+  resetSpeedSlider(); // every match starts at the standard 1.0x
 
   const center =
     mode === 'single'
@@ -673,7 +725,7 @@ function syncLocalPlayer(info: RoomInfo): void {
 function respawnLocalPlayer(local: Player, presence: OnlinePlayer): void {
   local.downed = false;
   local.alive = true;
-  local.hp = PLAYER_MAX_HP;
+  local.hp = local.maxHp;
   local.x = presence.x;
   local.z = presence.z;
   local.aimX = 1;
@@ -684,7 +736,9 @@ function respawnLocalPlayer(local: Player, presence: OnlinePlayer): void {
   local.reviveTimer = 0;
   local.reviveHold = 0;
   local.recoil = 0;
-  // Inventory reset: starter Pistol only (matches the local co-op revive).
+  // A fresh spawn ends any secret mode, then the inventory resets to the
+  // starter Pistol (matches the local co-op revive).
+  disableLiziMode(local);
   local.ammo.clear();
   local.granted.clear();
   local.weapon = WeaponId.Pistol;
@@ -800,10 +854,18 @@ function startOnlineMatch(info: RoomInfo): void {
   scoreLabelEl.textContent = 'TEAM ქულა';
   localSeat = Math.max(0, info.players.findIndex((p) => p.sessionId === info.selfId));
   const start = spawnForSeat(localSeat);
+  // Auto-assigned by seat; the session-only secret unlock overrides the local
+  // player with LIZI. Peers keep their deterministic seat-based mapping.
   players.push(
-    createPlayer(world.scene, 0, CHARACTER_ORDER[localSeat % CHARACTER_ORDER.length], start)
+    createPlayer(
+      world.scene,
+      0,
+      getCharacterOverride() ?? CHARACTER_ORDER[localSeat % CHARACTER_ORDER.length],
+      start
+    )
   );
   syncRemotePlayers(info);
+  resetSpeedSlider(); // every match starts at the standard 1.0x
 
   cameraRig = new CameraController(world, 'duo', centroidOf([...players, ...remotePlayers]));
 
@@ -1030,11 +1092,15 @@ function handleRemoteShot(event: PlayerShootEvent): void {
 
 /** Reports a blast this client resolved; the room owns its damage and chains. */
 function reportLocalExplosion(explosion: ExplosionEvent): void {
+  // The room re-runs the blast, so the reported base damage already carries
+  // LIZI's outgoing-damage scaling (falloff is recomputed server-side).
+  const owner = players[explosion.ownerIndex];
+  const damage = owner ? explosion.damage * owner.damageMult : explosion.damage;
   onlineLobby?.reportExplosion(
     explosion.x,
     explosion.z,
     explosion.radius,
-    explosion.damage,
+    damage,
     explosion.flatPlayerDamage !== undefined ? explosion.flatPlayerDamage : -1
   );
   // Remember it so the server's echo doesn't replay the same flash.
@@ -1130,6 +1196,10 @@ function backToMenu(): void {
   showMenu(lastMode); // highlight the controls layout of the mode just played
 }
 
+// The discreet "Secret" unlock (LIZI) is wired before the mode buttons so the
+// session override is ready the moment a match starts.
+initSecretCharacter();
+
 initMenu({
   onStart: (startMode, mapId) => startGame(startMode, mapId),
   onRestart: () => {
@@ -1192,10 +1262,12 @@ function tryFire(player: Player, nowMs: number): void {
   const weaponId = ensureWeaponUnlocked(player);
   const def = getWeapon(weaponId);
   if (!isReadyToFire(def, nowMs, player.lastFireMs)) return;
-  if (def.magSize > 0 && !player.ammo.has(weaponId)) {
+  // LIZI mode grants infinite ammo, so it skips both the first-shot magazine
+  // grant and the empty-magazine gate below.
+  if (!player.liziMode && def.magSize > 0 && !player.ammo.has(weaponId)) {
     player.ammo.set(weaponId, def.magSize); // first pickup grants a full magazine
   }
-  if (!hasAmmo(def, player.ammo.get(weaponId) ?? 0)) {
+  if (!player.liziMode && !hasAmmo(def, player.ammo.get(weaponId) ?? 0)) {
     if (weaponId !== WeaponId.Pistol) player.weapon = WeaponId.Pistol; // never soft-lock
     return;
   }
@@ -1215,7 +1287,10 @@ function tryFire(player: Player, nowMs: number): void {
   }
 
   player.lastFireMs = nowMs;
-  if (def.magSize > 0) player.ammo.set(weaponId, (player.ammo.get(weaponId) ?? 0) - 1);
+  // Ammo consumption evaluates the LIZI toggle FIRST: the cost is 0 while it is
+  // active, so no bullet / throwable is ever subtracted (reserves never deplete).
+  const cost = ammoCost(player, def);
+  if (cost > 0) player.ammo.set(weaponId, (player.ammo.get(weaponId) ?? 0) - cost);
   const power = player.powerTimer > 0 ? 2 : 1;
 
   // Tell the room we fired so every OTHER client replays the same tracer,
@@ -1277,7 +1352,10 @@ function tryFire(player: Player, nowMs: number): void {
     // radius takes the weapon's full direct-hit damage on firing, so a bullet
     // can never slip harmlessly past an enemy that is inside the player.
     const pointBlankDamage =
-      (def.closeRangeDamage > 0 ? def.closeRangeDamage : def.damage) * def.pelletCount * power;
+      (def.closeRangeDamage > 0 ? def.closeRangeDamage : def.damage) *
+      def.pelletCount *
+      power *
+      player.damageMult;
     let embeddedAny = false;
     for (const zombie of horde.zombies) {
       if (!zombie.alive) continue;
@@ -1339,10 +1417,18 @@ function tryFire(player: Player, nowMs: number): void {
         fx.impact(crate.cx + 0.5, crate.cz + 0.5, CRATE_CONFIG.tracerColor, 0.8);
         if (isOnline) {
           // The room applies the hit and splinters the crate for everyone.
-          onlineLobby?.reportPropDamage(crate.cx, crate.cz, def.damage * power);
+          onlineLobby?.reportPropDamage(crate.cx, crate.cz, def.damage * power * player.damageMult);
           return;
         }
-        if (damageBarricade(world.grid, world.scene, barricades, crate, def.damage * power)) {
+        if (
+          damageBarricade(
+            world.grid,
+            world.scene,
+            barricades,
+            crate,
+            def.damage * power * player.damageMult
+          )
+        ) {
           gibs.burst(crate.cx + 0.5, crate.cz + 0.5, 3); // splintered
         }
         return; // the pellet was absorbed by the crate
@@ -1353,7 +1439,7 @@ function tryFire(player: Player, nowMs: number): void {
     for (const hit of result.hits) {
       const zombie = horde.zombies[hit.index];
       if (!zombie || !zombie.alive) continue;
-      victims.set(zombie, (victims.get(zombie) ?? 0) + hit.damage * power);
+      victims.set(zombie, (victims.get(zombie) ?? 0) + hit.damage * power * player.damageMult);
     }
     // Mobs embedded in the player: guarantee the full point-blank hit even when
     // no pellet ray happened to line up with them.
@@ -1566,10 +1652,14 @@ function nearestBarricadeAlongRay(
  */
 function applyExplosion(explosion: ExplosionEvent): void {
   const owner = players[explosion.ownerIndex] ?? null;
+  // LIZI's outgoing-damage multiplier applies to her explosions too. The blast
+  // is clamped to the boss's explosive armor cap *after* scaling, exactly like a
+  // normal character's blast.
+  const damageMult = owner ? owner.damageMult : 1;
   const victims: { zombie: Zombie; amount: number }[] = [];
   explosion.zombieDamage.forEach((amount, index) => {
     const zombie = horde.zombies[index];
-    if (zombie?.alive) victims.push({ zombie, amount: explosiveDamageTo(zombie, amount) });
+    if (zombie?.alive) victims.push({ zombie, amount: explosiveDamageTo(zombie, amount * damageMult) });
   });
   if (owner && victims.length > 0) owner.shotsHit += 1; // projectile connected
   for (const { zombie, amount } of victims) damageZombie(zombie, amount, owner, null);
@@ -1685,6 +1775,13 @@ function updateLocalCurses(dt: number): void {
 }
 
 function applyDamage(player: Player, amount: number): void {
+  // LIZI GOD MODE: complete invulnerability — no source (zombies, devil
+  // charges, shockwaves, fire, explosions, curse) can hurt her, and HP stays
+  // pegged at max.
+  if (player.liziMode) {
+    player.hp = player.maxHp;
+    return;
+  }
   if (!player.alive || player.invulnTimer > 0 || amount <= 0) return;
   player.hp = Math.max(0, player.hp - amount);
   comboReset(player); // getting hurt resets the multiplier
@@ -1752,13 +1849,15 @@ function revivePlayer(player: Player, how: 'passive' | 'active'): void {
   player.mesh.visible = true;
   player.downed = false;
   player.alive = true;
-  player.hp = PLAYER_MAX_HP; // full base HP
+  player.hp = player.maxHp; // full (per-character) HP
   player.invulnTimer = COOP_CONFIG.reviveInvulnerability;
   player.blinkTimer = COOP_CONFIG.invulnBlinkInterval;
   player.reviveTimer = 0;
   player.reviveHold = 0;
   player.recoil = 0;
-  // Inventory reset: every weapon/ammo/grant is stripped — starter Pistol only.
+  // A revive ends any secret mode, then every weapon/ammo/grant is stripped —
+  // starter Pistol only.
+  disableLiziMode(player);
   player.ammo.clear();
   player.granted.clear();
   player.weapon = WeaponId.Pistol;
@@ -1820,7 +1919,7 @@ function updateMines(): void {
  * a co-op player is downed the ammo row is swapped for a blinking revive timer.
  */
 function updatePlayerCard(card: PlayerCard, player: Player): void {
-  card.hpFill.style.width = `${Math.max(0, Math.min(1, player.hp / PLAYER_MAX_HP)) * 100}%`;
+  card.hpFill.style.width = `${Math.max(0, Math.min(1, player.hp / player.maxHp)) * 100}%`;
   card.hpVal.textContent = String(Math.max(0, Math.round(player.hp)));
 
   const def = getWeapon(ensureWeaponUnlocked(player));
@@ -1846,7 +1945,32 @@ function updatePlayerCard(card: PlayerCard, player: Player): void {
   card.revive.hidden = true;
   card.ammoRow.hidden = false;
   card.ammo.textContent =
-    def.magSize === 0 ? '∞' : String(player.ammo.get(def.id) ?? def.magSize);
+    player.liziMode || def.magSize === 0
+      ? '∞'
+      : String(player.ammo.get(def.id) ?? def.magSize);
+}
+
+/**
+ * Flips the secret "all weapons + infinite ammo" mode for every LIZI player
+ * (normally just the local one). Non-LIZI characters are never affected.
+ */
+function toggleLiziModeForPlayers(): void {
+  let state: boolean | null = null;
+  for (const player of players) {
+    if (!player.alive || !canUseLiziMode(player)) continue;
+    state = toggleLiziMode(player);
+  }
+  if (state === null) return; // nobody in the match can use the secret mode
+  // Toggling off restores the standard speed; toggling on re-applies the slider.
+  if (state) applySpeedSlider();
+  else resetSpeedSlider();
+  audio.pickup();
+  toast(
+    state
+      ? 'LIZI GOD MODE: ACTIVE — INVULNERABLE · ALL WEAPONS · ∞ AMMO'
+      : 'LIZI GOD MODE: OFF — standard rules',
+    2.5
+  );
 }
 
 function update(dt: number, nowMs: number): void {
@@ -1858,6 +1982,9 @@ function update(dt: number, nowMs: number): void {
     hitStopTimer -= dt;
     return;
   }
+
+  // Secret LIZI mode: 'G' (or the HUD chip) flips all-weapons + infinite ammo.
+  if (inp.takeLiziToggle()) toggleLiziModeForPlayers();
 
   for (const player of players) {
     if (player.downed) {
@@ -1884,6 +2011,8 @@ function update(dt: number, nowMs: number): void {
       continue;
     }
     if (!player.alive) continue;
+    // LIZI GOD MODE: HP is pegged at max every frame (nothing can drain it).
+    if (player.liziMode) player.hp = player.maxHp;
     tickInvulnerability(player, dt); // post-revive i-frames
     const axes = inp.moveAxes(player.index);
     const moved = movePlayer(player, axes.dx, axes.dz, world.grid, dt);
@@ -2088,6 +2217,21 @@ function update(dt: number, nowMs: number): void {
     mult2.textContent = ` · P2 ×${p2.mult}`;
   } else {
     mult2.hidden = true;
+  }
+
+  // Secret LIZI mode chip: only rendered while a LIZI player is in the match.
+  const liziPlayer = players.find((p) => canUseLiziMode(p)) ?? null;
+  if (liziPlayer) {
+    liziChipEl.hidden = false;
+    liziChipEl.classList.toggle('active', liziPlayer.liziMode);
+    liziChipEl.textContent = liziPlayer.liziMode
+      ? 'LIZI GOD MODE: ACTIVE'
+      : 'LIZI GOD MODE: OFF — press G / F8';
+    // The speed slider is shown whenever a LIZI player is in the match.
+    speedSliderWrap.hidden = false;
+  } else {
+    liziChipEl.hidden = true;
+    speedSliderWrap.hidden = true;
   }
   const powered = players.some((p) => p.powerTimer > 0);
   powerupEl.hidden = !powered;

@@ -15,18 +15,39 @@ import {
   multiplierAfterKill,
   resetMultiplier,
 } from '../../../shared/src/combo.ts';
-import { PLAYER_CONFIG } from '../../../shared/src/balance.config.ts';
+import { LIZI_SPEED_SLIDER, LIZI_STATS, PLAYER_CONFIG } from '../../../shared/src/balance.config.ts';
 import type { CurseState } from '../../../shared/src/curse.ts';
 import { CHARACTERS, buildBoxhead } from './actors.ts';
 import type { CharacterId } from './actors.ts';
 
-// Tuning lives in `shared/src/balance.config.ts` (PLAYER_CONFIG).
+// Tuning lives in `shared/src/balance.config.ts` (PLAYER_CONFIG + LIZI_STATS).
 export const PLAYER_RADIUS = PLAYER_CONFIG.radius;
 export const PLAYER_MAX_HP = PLAYER_CONFIG.maxHp;
 export const PLAYER_SPEED = PLAYER_CONFIG.speed;
 export const POWER_DURATION = PLAYER_CONFIG.powerDuration; // seconds of POWER ×2
 /** Units/second the weapon kick recovers at (snappy but smooth). */
 export const RECOIL_RECOVERY = PLAYER_CONFIG.recoilRecovery;
+
+/** The secret character's id — the one whose stats come from `LIZI_STATS`. */
+export const SECRET_CHARACTER_ID: CharacterId = 'lizi';
+
+/**
+ * Starting / maximum HP for a character. Every character uses
+ * `PLAYER_CONFIG.maxHp` except LIZI, who uses `LIZI_STATS.MAX_HP`.
+ */
+export function characterMaxHp(character: CharacterId): number {
+  return character === SECRET_CHARACTER_ID ? LIZI_STATS.MAX_HP : PLAYER_MAX_HP;
+}
+
+/** Movement-speed multiplier from `LIZI_STATS.SPEED_MULTIPLIER` (1 for everyone else). */
+export function characterSpeedMult(character: CharacterId): number {
+  return character === SECRET_CHARACTER_ID ? LIZI_STATS.SPEED_MULTIPLIER : 1;
+}
+
+/** Outgoing weapon-damage multiplier (`LIZI_STATS.DAMAGE_MULTIPLIER`). */
+export function characterDamageMult(character: CharacterId): number {
+  return character === SECRET_CHARACTER_ID ? LIZI_STATS.DAMAGE_MULTIPLIER : 1;
+}
 
 /**
  * Spawn points — placed at the centres of OPEN grid cells.
@@ -74,6 +95,25 @@ export interface Player {
   shotsHit: number;
   /** Highest multiplier reached this match. */
   bestCombo: number;
+  /** Starting/max HP for this character (LIZI uses `LIZI_STATS.MAX_HP`). */
+  maxHp: number;
+  /** Per-character base speed multiplier (`LIZI_STATS.SPEED_MULTIPLIER`, else 1). */
+  speedBase: number;
+  /** Per-character outgoing weapon-damage multiplier (`LIZI_STATS.DAMAGE_MULTIPLIER`). */
+  damageMult: number;
+  /**
+   * LIZI-only GOD MODE: invulnerability (HP pegged at max), all weapons and
+   * infinite ammo, plus the speed-slider multiplier. Runtime + session-only: it
+   * lives on the live player, is never persisted, and resets when the match's
+   * players are recreated. See {@link toggleLiziMode}.
+   */
+  liziMode: boolean;
+  /** Live movement-speed multiplier from the god-mode slider (1 = normal). */
+  speedMultiplier: number;
+  /** Inventory snapshot captured when LIZI mode was enabled (null while off). */
+  liziSavedGranted: Set<number> | null;
+  liziSavedAmmo: Map<number, number> | null;
+  liziSavedWeapon: number | null;
   /** Move-speed multiplier granted by a combo spree (1 = normal). */
   speedMult: number;
   /** Seconds left on the spree speed boost. */
@@ -116,12 +156,13 @@ export function createPlayer(
   const mesh = buildBoxhead(CHARACTERS[character]);
   mesh.position.set(start.x, 0, start.z);
   scene.add(mesh);
+  const maxHp = characterMaxHp(character);
   return {
     index,
     character,
     x: start.x,
     z: start.z,
-    hp: PLAYER_MAX_HP,
+    hp: maxHp,
     alive: true,
     weapon: WeaponId.Pistol,
     ammo: new Map(),
@@ -138,6 +179,14 @@ export function createPlayer(
     shotsFired: 0,
     shotsHit: 0,
     bestCombo: BASE_MULTIPLIER,
+    maxHp,
+    speedBase: characterSpeedMult(character),
+    damageMult: characterDamageMult(character),
+    liziMode: false,
+    speedMultiplier: 1,
+    liziSavedGranted: null,
+    liziSavedAmmo: null,
+    liziSavedWeapon: null,
     speedMult: 1,
     spreeTimer: 0,
     recoil: 0,
@@ -167,7 +216,9 @@ export function movePlayer(
 ): boolean {
   if (dx === 0 && dz === 0) return false;
   const length = Math.hypot(dx, dz);
-  const speed = PLAYER_SPEED * player.speedMult; // spree boost scales this
+  // base speed × per-character multiplier (LIZI) × spree boost × god-mode slider
+  const speed =
+    PLAYER_SPEED * player.speedBase * player.speedMult * player.speedMultiplier;
   const nx = player.x + (dx / length) * speed * dt;
   const nz = player.z + (dz / length) * speed * dt;
   const resolved = grid.resolveCircle(nx, nz, PLAYER_RADIUS);
@@ -258,7 +309,7 @@ export function grantWeapon(player: Player, weaponId: number): void {
 /** Restores a living player to full health (wave-completion refill). */
 export function healToFull(player: Player): void {
   if (!player.alive) return;
-  player.hp = PLAYER_MAX_HP;
+  player.hp = player.maxHp;
 }
 
 export function unlockedWeaponIds(player: Player): number[] {
@@ -290,6 +341,67 @@ export function ensureWeaponUnlocked(player: Player): number {
     player.weapon = WeaponId.Pistol;
   }
   return player.weapon;
+}
+
+// ---------------------------------------------------------------------------
+// LIZI MODE — the secret character's "all weapons + infinite ammo" toggle
+// ---------------------------------------------------------------------------
+
+/** True when this player is allowed to use the secret mode (LIZI only). */
+export function canUseLiziMode(player: Player): boolean {
+  return player.character === SECRET_CHARACTER_ID;
+}
+
+/**
+ * Enables LIZI mode: grants every weapon in the table so the whole wheel is
+ * selectable, and flips the infinite-ammo flag the firing path reads before it
+ * spends a bullet. The current inventory is snapshotted first so
+ * {@link disableLiziMode} can restore it exactly.
+ */
+export function enableLiziMode(player: Player): void {
+  if (player.liziMode) return;
+  player.liziMode = true;
+  player.hp = player.maxHp; // invulnerable: HP is pegged at max while active
+  player.liziSavedGranted = new Set(player.granted);
+  player.liziSavedAmmo = new Map(player.ammo);
+  player.liziSavedWeapon = player.weapon;
+  for (const def of WEAPONS) player.granted.add(def.id);
+}
+
+/** Disables LIZI mode and restores the standard inventory/ammo/rules exactly. */
+export function disableLiziMode(player: Player): void {
+  if (!player.liziMode) return;
+  player.liziMode = false;
+  if (player.liziSavedGranted) player.granted = player.liziSavedGranted;
+  if (player.liziSavedAmmo) player.ammo = player.liziSavedAmmo;
+  if (player.liziSavedWeapon !== null) player.weapon = player.liziSavedWeapon;
+  player.liziSavedGranted = null;
+  player.liziSavedAmmo = null;
+  player.liziSavedWeapon = null;
+  // Speed returns to the standard multiplier when god mode ends.
+  player.speedMultiplier = LIZI_SPEED_SLIDER.DEFAULT;
+  // The restored weapon may be locked again (e.g. a tier gate) — fall back safely.
+  ensureWeaponUnlocked(player);
+}
+
+/**
+ * Flips LIZI mode for a player that is allowed to use it (LIZI only). Returns
+ * the resulting state, so the caller can drive the HUD + toast.
+ */
+export function toggleLiziMode(player: Player): boolean {
+  if (!canUseLiziMode(player)) return player.liziMode;
+  if (player.liziMode) disableLiziMode(player);
+  else enableLiziMode(player);
+  return player.liziMode;
+}
+
+/**
+ * The ammo a shot should spend. LIZI mode never consumes ammo (reserves never
+ * deplete), so the firing path asks this before subtracting.
+ */
+export function ammoCost(player: Player, def: WeaponDef): number {
+  if (player.liziMode) return 0; // infinite ammo — nothing is subtracted
+  return def.magSize > 0 ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

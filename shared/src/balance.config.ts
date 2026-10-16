@@ -548,6 +548,65 @@ export const PLAYER_CONFIG: PlayerBalance = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SECRET CHARACTER — "LIZI"
+//
+// LIZI is a hidden character unlocked on the character-selection screen with a
+// session-only secret code (see client/src/ui/characterSelect.ts — nothing is
+// persisted, so a reload locks her again). Every number that makes her play
+// differently is declared RIGHT HERE so she can be tuned in isolation.
+//
+// How each knob is consumed at runtime:
+//  - `MAX_HP`            → starting HP *and* the max HP a wave-end heal / a
+//                          revive / a health pack restores
+//                          (client/src/game/player.ts).
+//  - `DAMAGE_MULTIPLIER` → outgoing damage: hitscan pellets, the point-blank
+//                          guard, shots on crates/barrels and any explosion she
+//                          is credited for (client/src/main.ts).
+//  - `SPEED_MULTIPLIER`  → movement-speed multiplier on top of
+//                          PLAYER_CONFIG.speed (1.0 = the default speed).
+// ─────────────────────────────────────────────────────────────────────────────
+export interface LiziBalance {
+  /** Starting / maximum health (overrides PLAYER_CONFIG.maxHp). */
+  MAX_HP: number;
+  /** Outgoing weapon-damage multiplier. */
+  DAMAGE_MULTIPLIER: number;
+  /** Movement-speed multiplier on top of PLAYER_CONFIG.speed. */
+  SPEED_MULTIPLIER: number;
+}
+
+export const LIZI_STATS: LiziBalance = {
+  MAX_HP: 150, // Configurable starting / max health
+  DAMAGE_MULTIPLIER: 1.3, // Weapon damage multiplier (how much harder her weapons hit)
+  SPEED_MULTIPLIER: 1.0, // Movement speed multiplier
+};
+
+/**
+ * LIZI GOD MODE — the in-game speed-slider bounds (client HUD overlay).
+ *
+ * The slider is shown while a LIZI player is in the match and drives that
+ * player's live `speedMultiplier`, which `movePlayer` multiplies into the
+ * velocity. These are the exact numbers the HTML range input is configured
+ * from, so the UI and the movement math can never drift apart.
+ */
+export interface LiziSpeedSliderBalance {
+  /** Normal speed (slider minimum). */
+  MIN: number;
+  /** Extreme sprint (slider maximum). */
+  MAX: number;
+  /** Slider granularity. */
+  STEP: number;
+  /** Starting multiplier — also restored when god mode is toggled off. */
+  DEFAULT: number;
+}
+
+export const LIZI_SPEED_SLIDER: LiziSpeedSliderBalance = {
+  MIN: 1.0, // Normal speed
+  MAX: 3.5, // Extreme sprint
+  STEP: 0.1,
+  DEFAULT: 1.0,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CO-OP (Local 2-Player) — downed/revive loop
 // ─────────────────────────────────────────────────────────────────────────────
 export interface CoopBalance {

@@ -18,7 +18,7 @@ import type { PickupKind } from './actors.ts';
 import { WeaponId, getWeapon } from '../../../shared/src/weapons.ts';
 import { WAVE_CONFIG } from '../../../shared/src/balance.config.ts';
 import { bossLootCount, pickBossLoot } from '../../../shared/src/loot.ts';
-import { PLAYER_MAX_HP, POWER_DURATION, grantWeapon, isWeaponAvailable } from './player.ts';
+import { POWER_DURATION, grantWeapon, isWeaponAvailable } from './player.ts';
 import type { Player } from './player.ts';
 
 export interface Pickup {
@@ -146,7 +146,7 @@ export function applyPickup(player: Player, kind: PickupKind): string {
   // Health pack (Black Devil boss loot): restore HP, capped at the max.
   if (kind === 'health') {
     const before = player.hp;
-    player.hp = Math.min(PLAYER_MAX_HP, player.hp + WAVE_CONFIG.healthRestore);
+    player.hp = Math.min(player.maxHp, player.hp + WAVE_CONFIG.healthRestore);
     return `HEALTH +${Math.round(player.hp - before)}`;
   }
 

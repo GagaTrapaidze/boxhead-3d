@@ -17,6 +17,8 @@ const GAME_CODES = new Set([
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
   'KeyW', 'KeyA', 'KeyS', 'KeyD',
   'Space', 'Slash', 'Enter', 'Comma', 'Period', 'KeyQ', 'KeyE',
+  // Secret LIZI god-mode toggle — both hotkeys (only takes effect for LIZI).
+  'KeyG', 'F8',
   'Digit0', 'Digit1', 'Digit2', 'Digit3', 'Digit4',
   'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9',
 ]);
@@ -31,6 +33,8 @@ export class InputManager {
   private readonly keys = new Set<string>();
   private readonly pendingCycle = [0, 0];
   private pendingSlot: number | null = null;
+  /** Pending presses of the secret LIZI mode toggle key (consumed on read). */
+  private pendingLiziToggle = 0;
 
   constructor(mode: GameMode) {
     this.mode = mode;
@@ -50,6 +54,10 @@ export class InputManager {
     if (GAME_CODES.has(event.code)) event.preventDefault();
     if (event.repeat) return;
     this.keys.add(event.code);
+
+    // Secret god-mode toggle ('G' or 'F8') works in both layouts; the game
+    // ignores it unless the active player is LIZI.
+    if (event.code === 'KeyG' || event.code === 'F8') this.pendingLiziToggle += 1;
 
     if (this.mode === 'single') {
       if (event.code.startsWith('Digit')) {
@@ -127,5 +135,15 @@ export class InputManager {
     const slot = this.pendingSlot;
     this.pendingSlot = null;
     return slot;
+  }
+
+  /**
+   * Whether the secret LIZI mode toggle was pressed since the last read
+   * (consumed on read). The game applies it only to a LIZI player.
+   */
+  takeLiziToggle(): boolean {
+    const pressed = this.pendingLiziToggle > 0;
+    this.pendingLiziToggle = 0;
+    return pressed;
   }
 }

@@ -11,6 +11,8 @@ import {
   ENEMY_CONFIG,
   GRENADE_CONFIG,
   JUICE_CONFIG,
+  LIZI_SPEED_SLIDER,
+  LIZI_STATS,
   PHYSICS_CONFIG,
   PLAYER_CONFIG,
   PISTOL_CONFIG,
@@ -257,4 +259,42 @@ test('spatial hash broadphase uses a positive bucket size', () => {
     SPATIAL_CONFIG.cellSize >= ENEMY_CONFIG.devil.radius * 2,
     'a bucket spans at least the largest mob diameter'
   );
+});
+
+test('secret character LIZI: 150 HP, ×1.3 outgoing damage, default speed', () => {
+  // The three documented knobs — tuned in balance.config.ts, consumed by the
+  // client (player.ts hp/speed/damage, main.ts explosion scaling).
+  assert.equal(LIZI_STATS.MAX_HP, 150, 'LIZI starts at 150 HP');
+  assert.equal(LIZI_STATS.DAMAGE_MULTIPLIER, 1.3, 'weapon damage multiplier is 1.3');
+  assert.equal(LIZI_STATS.SPEED_MULTIPLIER, 1.0, 'her speed matches the default (×1.0)');
+  // She is deliberately tankier and hits harder than the base player.
+  assert.ok(LIZI_STATS.MAX_HP > PLAYER_CONFIG.maxHp,
+    `LIZI (${LIZI_STATS.MAX_HP}) must be tankier than the base ${PLAYER_CONFIG.maxHp} HP`);
+  assert.ok(LIZI_STATS.DAMAGE_MULTIPLIER > 1, 'LIZI hits harder than the base multiplier');
+  assert.ok(LIZI_STATS.SPEED_MULTIPLIER > 0, 'the speed multiplier is positive');
+  // The extra weapon damage stacks on the base table: her pistol out-damages a
+  // standard character's pistol while never becoming an instant-kill on bosses.
+  const liziPistol = PISTOL_CONFIG.damage * LIZI_STATS.DAMAGE_MULTIPLIER;
+  assert.ok(liziPistol > PISTOL_CONFIG.damage, 'her weapons hit harder than the base');
+  assert.ok(liziPistol < ENEMY_CONFIG.devil.hp,
+    'even a buffed pellet cannot one-shot the Devil');
+  // Her hp pool still leaves the flat grenade blast survivable on the first hit.
+  assert.ok(LIZI_STATS.MAX_HP - GRENADE_CONFIG.damageToPlayers > 0,
+    'even LIZI survives the first grenade blast');
+});
+
+test('LIZI god-mode speed slider: 1.0–3.5 in 0.1 steps, default 1.0', () => {
+  assert.equal(LIZI_SPEED_SLIDER.MIN, 1.0, 'the slider starts at normal speed');
+  assert.equal(LIZI_SPEED_SLIDER.MAX, 3.5, 'the slider tops out at extreme sprint');
+  assert.equal(LIZI_SPEED_SLIDER.STEP, 0.1, 'slider granularity is 0.1');
+  assert.equal(LIZI_SPEED_SLIDER.DEFAULT, 1.0, 'the default multiplier is 1.0');
+  assert.ok(LIZI_SPEED_SLIDER.MIN < LIZI_SPEED_SLIDER.MAX, 'the range is real');
+  assert.ok(
+    LIZI_SPEED_SLIDER.DEFAULT >= LIZI_SPEED_SLIDER.MIN &&
+      LIZI_SPEED_SLIDER.DEFAULT <= LIZI_SPEED_SLIDER.MAX,
+    'the default sits inside the range'
+  );
+  // min→max must be a whole number of steps, or the UI could never reach 3.5.
+  const steps = (LIZI_SPEED_SLIDER.MAX - LIZI_SPEED_SLIDER.MIN) / LIZI_SPEED_SLIDER.STEP;
+  assert.equal(steps, Math.round(steps), 'min→max is an exact whole number of steps');
 });
